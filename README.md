@@ -27,9 +27,8 @@ TG Ads → /start → team pick → first prediction (in-bot)
 | `META_PIXEL_ID` | Meta Pixel id — enables server-side CAPI events (Lead / CompleteRegistration / Purchase) |
 | `META_CAPI_TOKEN` | Meta Conversions API access token |
 | `PRIVACY_URL` | privacy policy link — appends a GDPR consent line to the verification ask (EU traffic) |
-| `FOOTBALL_API_KEY` | api-sports.io key — enables fixture auto-sync (free: 100 req/day, sync uses ~48) |
-| `FOOTBALL_LEAGUE_ID` | optional, default `1` (FIFA World Cup) |
-| `FOOTBALL_SEASON` | optional, default `2026` |
+| `ESPN_LEAGUE` | optional, default `fifa.world` — ESPN league slug, sync is keyless and free |
+| `SYNC_LOOKAHEAD_DAYS` | optional, default `30` — how far ahead to pull fixtures |
 | `NEWS_RSS_URL` | optional, defaults to BBC Football RSS |
 | `DIGEST_HOUR_UTC` | optional, daily news digest hour UTC (default 9) |
 
@@ -102,14 +101,14 @@ stops the cascade, sends the congrats + deposit-nudge message.
 
 ## Daily ops (admin commands in the bot)
 
-With `FOOTBALL_API_KEY` set, **matches run themselves**: fixtures sync from
-API-Sports every 30 min, announcements go out within 24h of kickoff,
+**Matches run themselves**: fixtures sync from ESPN's free scoreboard API
+(no key needed) every 30 min, announcements go out within 24h of kickoff,
 finished matches auto-settle — results, streaks, and bridge triggers fire
 without you. Admin commands remain as manual override:
 
 | Command | What it does |
 |---|---|
-| `/addmatch Brazil;Argentina;2026-06-15 18:00` | manually add a match (UTC) — only needed without the API key |
+| `/addmatch Brazil;Argentina;2026-06-15 18:00` | manually add a match (UTC) — manual fallback |
 | `/settle 3 1 2:1` | manually settle match #3 (auto-settle covers API matches) | |
 | `/stats` | funnel snapshot: users → team picked → predictors → emails → phones → bridge clicks → registered |
 | `/broadcast <text>` | send to everyone (rate-limited) |

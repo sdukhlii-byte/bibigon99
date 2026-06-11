@@ -44,6 +44,8 @@ PRIVACY_URL = os.getenv("PRIVACY_URL", "")            # GDPR notice link (EU tra
 FOOTBALL_API_KEY = os.getenv("FOOTBALL_API_KEY", "")   # legacy, no longer required
 ESPN_LEAGUE = os.getenv("ESPN_LEAGUE", "fifa.world")   # ESPN soccer league slug
 SYNC_LOOKAHEAD_DAYS = int(os.getenv("SYNC_LOOKAHEAD_DAYS", 30))
+ANNOUNCE_GAP = int(os.getenv("ANNOUNCE_GAP_HOURS", 6)) * 3600  # min gap between announce pushes per user
+SYNC_INTERVAL_MIN = int(os.getenv("SYNC_INTERVAL_MIN", 30))    # ESPN poll cadence; lower it on matchdays
 NEWS_RSS_URL = os.getenv("NEWS_RSS_URL",
                          "https://feeds.bbci.co.uk/sport/football/rss.xml")
 DIGEST_HOUR_UTC = int(os.getenv("DIGEST_HOUR_UTC", 9))
@@ -632,8 +634,9 @@ async def scheduler():
                 await db.weekly_reset()
                 await db.meta_set("week_start", str(week_start + 7 * DAY))
 
-            # 0a) fixtures auto-sync every 30 min (also auto-settles)
-            if now - int(await db.meta_get("last_sync", "0")) >= 1800:
+            # 0a) fixtures auto-sync (also auto-settles + win/loss pushes)
+            if now - int(await db.meta_get("last_sync", "0")) >= \
+                    SYNC_INTERVAL_MIN * 60:
                 await sync_fixtures()
                 await db.meta_set("last_sync", str(now))
 
@@ -650,12 +653,18 @@ async def scheduler():
                         await asyncio.sleep(0.05)
                 await db.meta_set("digest_date", today)
 
-            # 1) announce new matches (kickoff within 24h, not announced)
+            # 1) announce new matches (kickoff within 24h, not announced).
+            # Pacing: soonest kickoff goes first, and each user gets at most
+            # one announce push per ANNOUNCE_GAP — on 4-matches-a-day group
+            # stage days the rest stay reachable via /schedule, the daily
+            # digest and the mini app instead of flooding the chat.
             for m in await db.matches_where(
-                    "announced=0 AND result IS NULL AND kickoff BETWEEN ? AND ?",
-                    (now, now + DAY)):
+                    "announced=0 AND result IS NULL AND kickoff BETWEEN ? AND ? "
+                    "ORDER BY kickoff", (now, now + DAY)):
                 hours = max(1, (m["kickoff"] - now) // HOUR)
-                for u in await db.all_users("team IS NOT NULL AND blocked=0"):
+                for u in await db.all_users(
+                        "team IS NOT NULL AND blocked=0 "
+                        "AND last_announce_push < ?", (now - ANNOUNCE_GAP,)):
                     if u["team"] in (m["t1"], m["t2"]):
                         txt = T.NEW_MATCH_TEAM.format(
                             team=u["team"], t1=m["t1"], t2=m["t2"], hours=hours)
@@ -664,6 +673,7 @@ async def scheduler():
                     await safe_send_photo(
                         u["tg_id"], f"new_match_{m['id'] % 2 + 1}.png",
                         txt, reply_markup=kb_pick(m))
+                    await db.set_user(u["tg_id"], last_announce_push=now)
                     await asyncio.sleep(0.05)
                 await db.mark_announced(m["id"])
 
