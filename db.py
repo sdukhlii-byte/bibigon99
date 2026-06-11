@@ -6,6 +6,8 @@ import aiosqlite
 # Point DB_PATH at a mounted Railway volume (e.g. /data/funnel.db) —
 # otherwise every redeploy wipes users, picks and ad attribution.
 DB_PATH = os.getenv("DB_PATH", "funnel.db")
+if os.path.isdir(DB_PATH):              # common foot-gun: DB_PATH=/data
+    DB_PATH = os.path.join(DB_PATH, "funnel.db")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (

@@ -211,7 +211,8 @@ CASCADE_5D = (
 CASCADE_7D = (
     "Closing the topic — I won't bring the bonus up again. It stays attached to your "
     "league account; grab it whenever you're ready.\n\n"
-    "Meanwhile: <b>{team}</b> play soon. What's your call? The league doesn't stop 🎯"
+    "Meanwhile the league doesn't stop — <b>{team}</b> need your calls. "
+    "Next match: /schedule 🎯"
 )
 
 # ---------- FLOOR 6: registered, no deposit ----------
@@ -221,6 +222,22 @@ REG_CONGRATS = (
     "It activates with your first deposit — from <b>20 USDT</b>. The stack: "
     "<b>×2.25 on your bankroll + 80 free spins + cashback safety net</b>.\n\n"
     "{team} play soon — get it done before kickoff."
+)
+
+# used when the user's team has a REAL upcoming fixture in the calendar
+REG_CONGRATS_MATCH = (
+    "Account created, bonus locked to it ✅\n\n"
+    "It activates with your first deposit — from <b>20 USDT</b>. The stack: "
+    "<b>×2.25 on your bankroll + 80 free spins + cashback safety net</b>.\n\n"
+    "<b>{team} kick off in {hours}h</b> — get it done before the whistle."
+)
+
+# used when there is no scheduled fixture for the team (eliminated / Other)
+REG_CONGRATS_GENERIC = (
+    "Account created, bonus locked to it ✅\n\n"
+    "It activates with your first deposit — from <b>20 USDT</b>. The stack: "
+    "<b>×2.25 on your bankroll + 80 free spins + cashback safety net</b>.\n\n"
+    "Matches run every day — next one: /schedule. Lock it in before the odds move."
 )
 
 DEP_CONGRATS = (
