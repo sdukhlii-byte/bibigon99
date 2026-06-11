@@ -816,8 +816,18 @@ async def postback(request: web.Request):
         return web.Response(status=404, text="unknown uid")
     if event == "reg" and not user["registered"]:
         await db.set_user(uid, registered=1)
-        await safe_send_photo(uid, "streak_bonus.png",
-                              T.REG_CONGRATS.format(team=user["team"] or "Your team"))
+        # truth-checked urgency: only claim a kickoff if one actually exists
+        team, congrats = user["team"], None
+        if team:
+            nxt = await db.matches_where(
+                "result IS NULL AND kickoff > ? AND (t1=? OR t2=?) "
+                "ORDER BY kickoff LIMIT 1", (int(time.time()), team, team))
+            if nxt:
+                hours = max(1, (nxt[0]["kickoff"] - int(time.time())) // HOUR)
+                congrats = T.REG_CONGRATS_MATCH.format(team=team, hours=hours)
+        if not congrats:
+            congrats = T.REG_CONGRATS_GENERIC
+        await safe_send_photo(uid, "streak_bonus.png", congrats)
         await send_capi("CompleteRegistration", uid, user["source"])
         log.info("registration postback uid=%s source=%s", uid, user["source"])
     elif event in ("dep", "ftd", "deposit"):
