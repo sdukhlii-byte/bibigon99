@@ -1,8 +1,11 @@
 """SQLite data layer. Swap to Postgres later by replacing aiosqlite calls."""
+import os
 import time
 import aiosqlite
 
-DB_PATH = "funnel.db"
+# Point DB_PATH at a mounted Railway volume (e.g. /data/funnel.db) —
+# otherwise every redeploy wipes users, picks and ad attribution.
+DB_PATH = os.getenv("DB_PATH", "funnel.db")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -22,7 +25,12 @@ CREATE TABLE IF NOT EXISTS users (
     cascade_step INTEGER DEFAULT 0,          -- 0..4 (2h,24h,5d,7d done)
     last_matchday_push INTEGER DEFAULT 0,    -- ts, frequency cap
     created_at   INTEGER,
-    reminded_team INTEGER DEFAULT 0
+    reminded_team INTEGER DEFAULT 0,
+    source       TEXT,                       -- /start deep-link payload (ad attribution)
+    blocked      INTEGER DEFAULT 0,          -- user blocked the bot; skip in pushes
+    week_correct INTEGER DEFAULT 0,          -- weekly league (prize pool window)
+    week_total   INTEGER DEFAULT 0,
+    capi_lead_sent INTEGER DEFAULT 0         -- Meta CAPI Lead dedup
 );
 CREATE TABLE IF NOT EXISTS matches (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -52,7 +60,11 @@ async def init():
         await db.executescript(SCHEMA)
         # safe migrations for DBs created before these columns existed
         for col, ddl in [("phone", "TEXT"), ("last_pick_at", "INTEGER DEFAULT 0"),
-                         ("rehooked", "INTEGER DEFAULT 0")]:
+                         ("rehooked", "INTEGER DEFAULT 0"),
+                         ("source", "TEXT"), ("blocked", "INTEGER DEFAULT 0"),
+                         ("week_correct", "INTEGER DEFAULT 0"),
+                         ("week_total", "INTEGER DEFAULT 0"),
+                         ("capi_lead_sent", "INTEGER DEFAULT 0")]:
             try:
                 await db.execute(f"ALTER TABLE users ADD COLUMN {col} {ddl}")
             except Exception:
@@ -99,22 +111,24 @@ async def upsert_match_ext(ext_id: str, t1: str, t2: str, kickoff: int) -> int:
 async def user_rank(uid: int):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT correct FROM users WHERE tg_id=?", (uid,))
+            "SELECT week_correct FROM users WHERE tg_id=?", (uid,))
         row = await cur.fetchone()
         if not row:
             return None
         cur = await db.execute(
-            "SELECT COUNT(*)+1 FROM users WHERE total>0 AND correct>?", (row[0],))
+            "SELECT COUNT(*)+1 FROM users WHERE week_total>0 AND week_correct>?",
+            (row[0],))
         (rank,) = await cur.fetchone()
         return rank
 
 
-async def upsert_user(tg_id: int, name: str):
+async def upsert_user(tg_id: int, name: str, source: str | None = None):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT INTO users (tg_id, name, created_at) VALUES (?,?,?) "
-            "ON CONFLICT(tg_id) DO UPDATE SET name=excluded.name",
-            (tg_id, name, int(time.time())),
+            "INSERT INTO users (tg_id, name, created_at, source) VALUES (?,?,?,?) "
+            "ON CONFLICT(tg_id) DO UPDATE SET name=excluded.name, blocked=0, "
+            "source=COALESCE(users.source, excluded.source)",   # first touch wins
+            (tg_id, name, int(time.time()), source),
         )
         await db.commit()
 
@@ -204,10 +218,12 @@ async def settle_match(mid: int, result: str, score: str):
             if ok:
                 await db.execute(
                     "UPDATE users SET streak=streak+1, correct=correct+1, "
-                    "total=total+1 WHERE tg_id=?", (p["user_id"],))
+                    "total=total+1, week_correct=week_correct+1, "
+                    "week_total=week_total+1 WHERE tg_id=?", (p["user_id"],))
             else:
                 await db.execute(
-                    "UPDATE users SET streak=0, total=total+1 WHERE tg_id=?",
+                    "UPDATE users SET streak=0, total=total+1, "
+                    "week_total=week_total+1 WHERE tg_id=?",
                     (p["user_id"],))
             out.append((p["user_id"], ok))
         await db.commit()
@@ -222,12 +238,30 @@ async def converted_count() -> int:
 
 
 async def leaderboard(limit: int = 20):
+    """Weekly league — matches the 'Top 10 every week' prize promise."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
-            "SELECT name, team, correct, total, streak FROM users "
-            "WHERE total > 0 ORDER BY correct DESC, total ASC LIMIT ?", (limit,))
+            "SELECT name, team, week_correct AS correct, week_total AS total, "
+            "streak FROM users WHERE week_total > 0 "
+            "ORDER BY week_correct DESC, week_total ASC LIMIT ?", (limit,))
         return await cur.fetchall()
+
+
+async def weekly_top(limit: int = 10):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT tg_id, name, week_correct, week_total FROM users "
+            "WHERE week_total > 0 ORDER BY week_correct DESC, week_total ASC "
+            "LIMIT ?", (limit,))
+        return await cur.fetchall()
+
+
+async def weekly_reset():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE users SET week_correct=0, week_total=0")
+        await db.commit()
 
 
 async def user_picks(uid: int):
@@ -254,3 +288,12 @@ async def stats():
             cur = await db.execute(sql)
             (out[k],) = await cur.fetchone()
         return out
+
+
+async def stats_by_source():
+    """source -> (users, registered). Ad-set level read straight in the bot."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT COALESCE(source,'organic'), COUNT(*), SUM(registered) "
+            "FROM users GROUP BY 1 ORDER BY 2 DESC")
+        return await cur.fetchall()

@@ -11,15 +11,17 @@ ENV:
   PORT             - http port for postback server (Railway sets it)
 """
 import asyncio
+import hashlib
 import logging
 import os
 import re
 import time
 
+import aiohttp
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
-from aiogram.filters import Command, CommandObject, CommandStart
+from aiogram.filters import Command, CommandStart
 from aiogram.types import (CallbackQuery, InlineKeyboardButton,
                            InlineKeyboardMarkup, KeyboardButton, Message,
                            ReplyKeyboardMarkup, ReplyKeyboardRemove)
@@ -36,12 +38,11 @@ PRELANDING_URL = os.getenv("PRELANDING_URL", "https://example.com")
 TRACKER_URL = os.getenv("TRACKER_URL", "")   # Keitaro campaign URL; if set, bridge goes through it
 WEBAPP_URL = os.getenv("WEBAPP_URL", PRELANDING_URL)
 POSTBACK_SECRET = os.getenv("POSTBACK_SECRET", "change-me")
-FOOTBALL_PROVIDER = os.getenv("FOOTBALL_PROVIDER", "espn")
-# espn        — no key needed, public scoreboard endpoint (default)
-# footballdata — football-data.org, free tier includes World Cup, set FOOTBALL_API_KEY
-# apisports   — api-sports.io v3, paid plan required for season 2026, set FOOTBALL_API_KEY
-FOOTBALL_API_KEY = os.getenv("FOOTBALL_API_KEY", "")
-FOOTBALL_LEAGUE_ID = os.getenv("FOOTBALL_LEAGUE_ID", "1")   # apisports: 1 = FIFA World Cup
+META_PIXEL_ID = os.getenv("META_PIXEL_ID", "")        # Meta CAPI: server-side events
+META_CAPI_TOKEN = os.getenv("META_CAPI_TOKEN", "")
+PRIVACY_URL = os.getenv("PRIVACY_URL", "")            # GDPR notice link (EU traffic)
+FOOTBALL_API_KEY = os.getenv("FOOTBALL_API_KEY", "")   # api-sports.io (API-Football v3) key
+FOOTBALL_LEAGUE_ID = os.getenv("FOOTBALL_LEAGUE_ID", "1")   # 1 = FIFA World Cup
 FOOTBALL_SEASON = os.getenv("FOOTBALL_SEASON", "2026")
 NEWS_RSS_URL = os.getenv("NEWS_RSS_URL",
                          "https://feeds.bbci.co.uk/sport/football/rss.xml")
@@ -49,34 +50,6 @@ DIGEST_HOUR_UTC = int(os.getenv("DIGEST_HOUR_UTC", 9))
 
 EMAIL_RE = re.compile(r"^[\w.+-]+@[\w-]+\.[\w.]+$")
 HOUR, DAY = 3600, 86400
-
-META_PIXEL_ID = os.getenv("META_PIXEL_ID", "")
-META_CAPI_TOKEN = os.getenv("META_CAPI_TOKEN", "")
-
-
-async def meta_event(event_name: str, tg_id: int):
-    """Server-side conversion to Meta CAPI so the algo has food to optimize on.
-    Matched via hashed external_id; enrich with fbp/fbclid on the prelanding
-    pixel for higher match quality."""
-    if not (META_PIXEL_ID and META_CAPI_TOKEN):
-        return
-    import hashlib as _h
-    import aiohttp as _aio
-    payload = {"data": [{
-        "event_name": event_name,
-        "event_time": int(time.time()),
-        "action_source": "website",
-        "user_data": {"external_id":
-                      _h.sha256(str(tg_id).encode()).hexdigest()},
-    }]}
-    try:
-        async with _aio.ClientSession() as s:
-            await s.post(
-                f"https://graph.facebook.com/v21.0/{META_PIXEL_ID}/events",
-                params={"access_token": META_CAPI_TOKEN},
-                json=payload, timeout=10)
-    except Exception as e:
-        log.warning("meta capi failed: %s", e)
 
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
@@ -128,18 +101,6 @@ def kb_contact() -> ReplyKeyboardMarkup:
         resize_keyboard=True, one_time_keyboard=True)
 
 
-def kb_main() -> ReplyKeyboardMarkup:
-    """Persistent menu under the input field — core funnel always visible."""
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text=T.BTN_MENU_PICK),
-             KeyboardButton(text=T.BTN_MENU_STATS)],
-            [KeyboardButton(text=T.BTN_MENU_NEWS),
-             KeyboardButton(text=T.BTN_MENU_HUB)],
-        ],
-        resize_keyboard=True, is_persistent=True)
-
-
 def kb_webapp() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text=T.BTN_OPEN_APP, url=WEBAPP_URL)
@@ -152,19 +113,108 @@ async def safe_send(uid: int, text: str, **kw):
         return True
     except Exception as e:           # blocked / deactivated — never crash loop
         log.warning("send to %s failed: %s", uid, e)
+        if "blocked" in str(e).lower() or "deactivated" in str(e).lower():
+            await db.set_user(uid, blocked=1)   # drop from future pushes
         return False
+
+
+# ----------------------------------------------------------------------
+# MEDIA — funnel-stage creatives (media/*.png). Missing file -> text only.
+# ----------------------------------------------------------------------
+from aiogram.types import FSInputFile
+
+MEDIA_DIR = os.getenv("MEDIA_DIR", "media")
+
+
+def media(name: str):
+    path = os.path.join(MEDIA_DIR, name)
+    return path if os.path.exists(path) else None
+
+
+async def safe_send_photo(uid: int, img: str | None, caption: str, **kw):
+    """Photo + caption; falls back to plain text if the image is missing,
+    the caption exceeds Telegram's 1024-char photo limit, or sending fails."""
+    path = media(img) if img else None
+    if not path or len(caption) > 1024:
+        return await safe_send(uid, caption, **kw)
+    try:
+        await bot.send_photo(uid, FSInputFile(path), caption=caption, **kw)
+        return True
+    except Exception as e:
+        log.warning("photo to %s failed (%s), falling back to text", uid, e)
+        if "blocked" in str(e).lower() or "deactivated" in str(e).lower():
+            await db.set_user(uid, blocked=1)
+            return False
+        return await safe_send(uid, caption, **kw)
+
+
+# ----------------------------------------------------------------------
+# META CAPI — server-side conversions (Lead / CompleteRegistration / Purchase)
+# ----------------------------------------------------------------------
+async def send_capi(event: str, uid: int, source: str | None = None):
+    """Fire a server event to Meta. external_id = sha256(tg_id) for matching;
+    event_id dedupes against the browser pixel on the prelanding."""
+    if not (META_PIXEL_ID and META_CAPI_TOKEN):
+        return
+    payload = {"data": [{
+        "event_name": event,
+        "event_time": int(time.time()),
+        "event_id": f"{event.lower()}_{uid}",
+        "action_source": "chat",
+        "user_data": {
+            "external_id": hashlib.sha256(str(uid).encode()).hexdigest()},
+        "custom_data": {"source": source or "organic"},
+    }]}
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.post(
+                    f"https://graph.facebook.com/v19.0/{META_PIXEL_ID}/events",
+                    params={"access_token": META_CAPI_TOKEN},
+                    json=payload, timeout=15) as resp:
+                if resp.status != 200:
+                    log.warning("CAPI %s for %s -> %s: %s",
+                                event, uid, resp.status, await resp.text())
+    except Exception as e:
+        log.warning("CAPI %s for %s failed: %s", event, uid, e)
+
+
+async def capi_lead_once(uid: int):
+    """Lead = first verified contact (phone or email). Fires exactly once."""
+    u = await db.get_user(uid)
+    if u and not u["capi_lead_sent"]:
+        await db.set_user(uid, capi_lead_sent=1)
+        await send_capi("Lead", uid, u["source"])
 
 
 # ----------------------------------------------------------------------
 # FLOOR 1 — /start + team segmentation
 # ----------------------------------------------------------------------
 @r.message(CommandStart())
-async def start(msg: Message, command: CommandObject):
-    source = (command.args or "").strip()[:64] or None
+async def start(msg: Message):
+    # deep-link payload = ad attribution: t.me/bot?start=ig_wc_lal_001
+    parts = (msg.text or "").split(maxsplit=1)
+    payload = parts[1].strip()[:64] if len(parts) > 1 else None
+
+    existing = await db.get_user(msg.from_user.id)
     await db.upsert_user(msg.from_user.id, msg.from_user.first_name or "mate",
-                         source=source)
-    text = T.START_IG if source and source.startswith("ig") else T.START
-    await msg.answer(text, reply_markup=kb_teams())
+                         source=payload)
+
+    # returning player with a team: don't reset them to the quiz
+    if existing and existing["team"]:
+        await msg.answer(T.WELCOME_BACK.format(team=existing["team"]),
+                         reply_markup=kb_webapp())
+        return
+
+    # ad scent: greeting matches the traffic source (ig_* = Instagram/Meta)
+    greet = T.START_IG if payload and payload.startswith("ig") else T.START
+    if media("start.png"):
+        try:
+            await msg.answer_photo(FSInputFile(media("start.png")),
+                                   caption=greet, reply_markup=kb_teams())
+            return
+        except Exception as e:
+            log.warning("start photo failed: %s", e)
+    await msg.answer(greet, reply_markup=kb_teams())
 
 
 @r.callback_query(F.data.startswith("team:"))
@@ -185,10 +235,6 @@ async def team_chosen(cb: CallbackQuery):
     else:
         await cb.message.edit_text(T.TEAM_SAVED_NO_MATCH.format(team=team),
                                    reply_markup=kb_webapp())
-    # proactive capture: ask for verification right here, in onboarding
-    user = await db.get_user(cb.from_user.id)
-    if user and not user["phone"] and not user["email"]:
-        await cb.message.answer(T.VERIFY_PUSH, reply_markup=kb_contact())
 
 
 # ----------------------------------------------------------------------
@@ -204,8 +250,11 @@ async def pick(cb: CallbackQuery):
 
     user = await db.get_user(cb.from_user.id)
     if first and not user["phone"] and not user["email"]:
-        await cb.message.answer(T.PREDICTION_SAVED.format(pick=label),
-                                reply_markup=kb_contact())
+        ask = T.PREDICTION_SAVED.format(pick=label)
+        if PRIVACY_URL:
+            ask += T.PRIVACY_FOOTNOTE.format(url=PRIVACY_URL)
+        await cb.message.answer(ask, reply_markup=kb_contact(),
+                                disable_web_page_preview=True)
     else:
         await cb.message.answer(
             f"Pick locked: <b>{label}</b> 🎯 I'll ping you at the final whistle.",
@@ -218,37 +267,15 @@ async def got_contact(msg: Message):
         return
     await db.set_user(msg.from_user.id,
                       phone=msg.contact.phone_number, awaiting_email=0)
-    await meta_event("Lead", msg.from_user.id)
-    await msg.answer(T.CONTACT_SAVED, reply_markup=kb_main())
+    await capi_lead_once(msg.from_user.id)
+    await msg.answer(T.CONTACT_SAVED, reply_markup=ReplyKeyboardRemove())
+    await msg.answer("Live hub 👇", reply_markup=kb_webapp())
 
 
 @r.message(F.text == T.BTN_VERIFY_SKIP)
 async def contact_skipped(msg: Message):
     await db.set_user(msg.from_user.id, awaiting_email=1)
-    await msg.answer(T.ASK_EMAIL_FALLBACK, reply_markup=kb_main())
-
-
-# ---------- persistent menu routing ----------
-
-@r.message(F.text == T.BTN_MENU_PICK)
-async def menu_pick(msg: Message):
-    await schedule_cmd(msg)
-
-
-@r.message(F.text == T.BTN_MENU_STATS)
-async def menu_stats(msg: Message):
-    await mystats_cmd(msg)
-
-
-@r.message(F.text == T.BTN_MENU_NEWS)
-async def menu_news(msg: Message):
-    await news_cmd(msg)
-
-
-@r.message(F.text == T.BTN_MENU_HUB)
-async def menu_hub(msg: Message):
-    await msg.answer("Live scores, league, and the PLAY tab 👇",
-                     reply_markup=kb_webapp())
+    await msg.answer(T.ASK_EMAIL_FALLBACK, reply_markup=ReplyKeyboardRemove())
 
 
 @r.message(Command("skip"))
@@ -271,8 +298,8 @@ async def maybe_email(msg: Message):
     if EMAIL_RE.match(msg.text.strip()):
         await db.set_user(msg.from_user.id,
                           email=msg.text.strip().lower(), awaiting_email=0)
-        await meta_event("Lead", msg.from_user.id)
-        await msg.answer(T.EMAIL_SAVED, reply_markup=kb_main())
+        await capi_lead_once(msg.from_user.id)
+        await msg.answer(T.EMAIL_SAVED, reply_markup=kb_webapp())
     else:
         await msg.answer(T.EMAIL_INVALID)
 
@@ -280,11 +307,11 @@ async def maybe_email(msg: Message):
 # ----------------------------------------------------------------------
 # FLOOR 3 — bridge triggers fire from settle / scheduler (below)
 # ----------------------------------------------------------------------
-async def fire_bridge(uid: int, text: str, label: str):
+async def fire_bridge(uid: int, text: str, label: str, img: str | None = None):
     user = await db.get_user(uid)
     if not user or user["registered"]:
         return
-    if await safe_send(uid, text, reply_markup=kb_bridge(uid, label)):
+    if await safe_send_photo(uid, img, text, reply_markup=kb_bridge(uid, label)):
         # bridge shown -> cascade clock starts on click; we approximate with show time
         if not user["bridge_clicked_at"]:
             await db.set_user(uid, bridge_clicked_at=int(time.time()))
@@ -305,7 +332,8 @@ async def addmatch(msg: Message):
     try:
         _, payload = msg.text.split(" ", 1)
         t1, t2, dt = [x.strip() for x in payload.split(";")]
-        kickoff = int(time.mktime(time.strptime(dt, "%Y-%m-%d %H:%M")))
+        import calendar
+        kickoff = calendar.timegm(time.strptime(dt, "%Y-%m-%d %H:%M"))
         mid = await db.add_match(t1, t2, kickoff)
         await msg.answer(f"Match #{mid} added: {t1} vs {t2} @ {dt} UTC")
     except Exception as e:
@@ -324,7 +352,8 @@ async def do_settle(mid: int, result: str, score: str) -> int:
                 points=10, streak=u["streak"]))
             if u["streak"] >= 3 and not u["registered"]:
                 await fire_bridge(uid, T.TRIGGER_STREAK.format(
-                    name=u["name"], streak=u["streak"]), T.BRIDGE_BUTTON)
+                    name=u["name"], streak=u["streak"]), T.BRIDGE_BUTTON,
+                    img="streak_bonus.png")
         else:
             await safe_send(uid, T.RESULT_LOSS.format(
                 t1=m["t1"], t2=m["t2"], score=score))
@@ -356,10 +385,10 @@ async def stats(msg: Message):
         return
     s = await db.stats()
     lines = [f"<b>{k}</b>: {v}" for k, v in s.items()]
-    src = await db.source_counts()
-    if src:
+    by_src = await db.stats_by_source()
+    if by_src:
         lines.append("\n<b>By source</b> (users / regs):")
-        lines += [f"  {name}: {n} / {regs or 0}" for name, n, regs in src]
+        lines += [f"• {src}: {n} / {regs or 0}" for src, n, regs in by_src]
     await msg.answer("\n".join(lines))
 
 
@@ -367,8 +396,12 @@ async def stats(msg: Message):
 async def broadcast(msg: Message):
     if not admin(msg):
         return
-    text = msg.text.split(" ", 1)[1]
-    users = await db.all_users()
+    parts = msg.text.split(" ", 1)
+    if len(parts) < 2 or not parts[1].strip():
+        await msg.answer("Usage: /broadcast <text>")
+        return
+    text = parts[1]
+    users = await db.all_users("blocked=0")
     sent = 0
     for u in users:
         sent += await safe_send(u["tg_id"], text)
@@ -438,6 +471,7 @@ async def mystats_cmd(msg: Message):
         return
     await msg.answer(T.MYSTATS.format(
         team=u["team"] or "—", total=u["total"], correct=u["correct"],
+        week_correct=u["week_correct"], week_total=u["week_total"],
         accuracy=round(100 * u["correct"] / u["total"]),
         streak=u["streak"], rank=await db.user_rank(msg.from_user.id)))
 
@@ -445,142 +479,54 @@ async def mystats_cmd(msg: Message):
 FINISHED_STATUSES = {"FT", "AET", "PEN"}   # api-sports fixture status codes
 
 
-async def _process_fixture(ext_id: str, t1: str, t2: str, kickoff: int,
-                           finished: bool, res: str | None,
-                           score: str | None, counters: dict):
-    """Shared upsert + auto-settle for every provider."""
-    mid = await db.upsert_match_ext(ext_id, t1, t2, kickoff)
-    counters["fixtures"] += 1
-    if finished and res and score:
-        local = await db.get_match(mid)
-        if local and not local["result"]:
-            await do_settle(mid, res, score)
-            counters["settled"] += 1
-            log.info("auto-settled match %s", mid)
-
-
-async def _fetch_json(url: str, headers=None, params=None):
-    async with aiohttp.ClientSession() as s:
-        async with s.get(url, headers=headers, params=params,
-                         timeout=20) as resp:
-            return await resp.json()
-
-
-async def _sync_espn(counters: dict):
-    """ESPN public scoreboard — no API key required."""
-    from datetime import datetime, timedelta, timezone
-    now = datetime.now(timezone.utc)
-    dates = (f"{(now - timedelta(days=3)).strftime('%Y%m%d')}"
-             f"-{(now + timedelta(days=45)).strftime('%Y%m%d')}")
-    data = await _fetch_json(
-        "https://site.api.espn.com/apis/site/v2/sports/soccer/"
-        "fifa.world/scoreboard", params={"dates": dates, "limit": "400"})
-    for ev in data.get("events", []):
-        try:
-            comp = ev["competitions"][0]
-            home = next(c for c in comp["competitors"]
-                        if c["homeAway"] == "home")
-            away = next(c for c in comp["competitors"]
-                        if c["homeAway"] == "away")
-            kickoff = int(datetime.fromisoformat(
-                ev["date"].replace("Z", "+00:00")).timestamp())
-            finished = bool(ev["status"]["type"].get("completed"))
-            res = score = None
-            if finished:
-                if home.get("winner"):
-                    res = "1"
-                elif away.get("winner"):
-                    res = "2"
-                else:
-                    res = "X"
-                score = f"{home.get('score', '?')}:{away.get('score', '?')}"
-            await _process_fixture(
-                f"espn_{ev['id']}", home["team"]["displayName"],
-                away["team"]["displayName"], kickoff, finished, res, score,
-                counters)
-        except Exception:
-            log.exception("bad espn event")
-
-
-async def _sync_footballdata(counters: dict):
-    """football-data.org v4 — free tier includes the World Cup (WC)."""
-    import calendar as _cal
-    data = await _fetch_json(
-        "https://api.football-data.org/v4/competitions/WC/matches",
-        headers={"X-Auth-Token": FOOTBALL_API_KEY})
-    if data.get("errorCode") or data.get("message") and not data.get("matches"):
-        raise RuntimeError(data.get("message", "football-data error"))
-    for m in data.get("matches", []):
-        try:
-            kickoff = _cal.timegm(
-                time.strptime(m["utcDate"], "%Y-%m-%dT%H:%M:%SZ"))
-            finished = m.get("status") == "FINISHED"
-            res = score = None
-            if finished:
-                res = {"HOME_TEAM": "1", "AWAY_TEAM": "2",
-                       "DRAW": "X"}.get(m["score"].get("winner"))
-                ft = m["score"].get("fullTime", {})
-                if ft.get("home") is not None:
-                    score = f"{ft['home']}:{ft['away']}"
-            await _process_fixture(
-                f"fd_{m['id']}",
-                m["homeTeam"].get("name") or m["homeTeam"].get("tla") or "TBD",
-                m["awayTeam"].get("name") or m["awayTeam"].get("tla") or "TBD",
-                kickoff, finished, res, score, counters)
-        except Exception:
-            log.exception("bad footballdata row")
-
-
-async def _sync_apisports(counters: dict):
-    """api-sports.io v3 — paid plan needed for season 2026."""
-    from datetime import datetime
-    data = await _fetch_json(
-        "https://v3.football.api-sports.io/fixtures",
-        headers={"x-apisports-key": FOOTBALL_API_KEY},
-        params={"league": FOOTBALL_LEAGUE_ID, "season": FOOTBALL_SEASON})
-    if data.get("errors"):
-        raise RuntimeError(str(data["errors"]))
-    for row in data.get("response", []):
-        try:
-            fx, teams, goals = row["fixture"], row["teams"], row["goals"]
-            kickoff = int(
-                datetime.fromisoformat(fx["date"]).timestamp())
-            finished = fx["status"]["short"] in FINISHED_STATUSES
-            res = score = None
-            if finished and goals.get("home") is not None:
-                if teams["home"].get("winner"):
-                    res = "1"
-                elif teams["away"].get("winner"):
-                    res = "2"
-                else:
-                    res = "X"
-                score = f"{goals['home']}:{goals['away']}"
-            await _process_fixture(
-                f"as_{fx['id']}", teams["home"]["name"] or "TBD",
-                teams["away"]["name"] or "TBD", kickoff, finished, res,
-                score, counters)
-        except Exception:
-            log.exception("bad apisports row")
-
-
-PROVIDERS = {"espn": _sync_espn, "footballdata": _sync_footballdata,
-             "apisports": _sync_apisports}
-
-
 async def sync_fixtures() -> dict:
-    """Pull fixtures/results from the configured provider and auto-settle."""
-    fn = PROVIDERS.get(FOOTBALL_PROVIDER)
-    if not fn:
-        return {"error": f"unknown FOOTBALL_PROVIDER '{FOOTBALL_PROVIDER}'"}
-    if FOOTBALL_PROVIDER != "espn" and not FOOTBALL_API_KEY:
-        return {"error": f"{FOOTBALL_PROVIDER} needs FOOTBALL_API_KEY"}
-    counters = {"fixtures": 0, "settled": 0}
+    """Pull World Cup fixtures/results from API-Sports v3 and auto-settle.
+    Returns a summary dict for logging / the /sync admin command."""
+    if not FOOTBALL_API_KEY:
+        return {"error": "FOOTBALL_API_KEY is not set"}
     try:
-        await fn(counters)
+        async with aiohttp.ClientSession() as s:
+            async with s.get(
+                    "https://v3.football.api-sports.io/fixtures",
+                    params={"league": FOOTBALL_LEAGUE_ID,
+                            "season": FOOTBALL_SEASON},
+                    headers={"x-apisports-key": FOOTBALL_API_KEY},
+                    timeout=20) as resp:
+                data = await resp.json()
     except Exception as e:
         log.warning("fixtures sync failed: %s", e)
         return {"error": str(e)}
-    return counters
+    if data.get("errors"):
+        log.warning("api-sports errors: %s", data["errors"])
+        return {"error": str(data["errors"])}
+
+    from datetime import datetime
+    upserted = settled = 0
+    for row in data.get("response", []):
+        try:
+            fx, teams, goals = row["fixture"], row["teams"], row["goals"]
+            t1 = teams["home"]["name"] or "TBD"
+            t2 = teams["away"]["name"] or "TBD"
+            kickoff = int(datetime.fromisoformat(fx["date"]).timestamp())
+            mid = await db.upsert_match_ext(str(fx["id"]), t1, t2, kickoff)
+            upserted += 1
+            if fx["status"]["short"] in FINISHED_STATUSES:
+                local = await db.get_match(mid)
+                if local and not local["result"] \
+                        and goals.get("home") is not None:
+                    if teams["home"].get("winner"):
+                        res = "1"
+                    elif teams["away"].get("winner"):
+                        res = "2"
+                    else:
+                        res = "X"
+                    await do_settle(mid, res,
+                                    f"{goals['home']}:{goals['away']}")
+                    settled += 1
+                    log.info("auto-settled match %s", mid)
+        except Exception:
+            log.exception("bad fixture row")
+    return {"fixtures": upserted, "settled": settled}
 
 
 @r.message(Command("sync"))
@@ -591,10 +537,10 @@ async def sync_cmd(msg: Message):
     res = await sync_fixtures()
     await db.meta_set("last_sync", str(int(time.time())))
     if "error" in res:
-        await msg.answer(f"⚠️ Sync error ({FOOTBALL_PROVIDER}): {res['error']}")
+        await msg.answer(f"⚠️ Sync error: {res['error']}")
     else:
-        await msg.answer(f"✅ [{FOOTBALL_PROVIDER}] Synced {res['fixtures']} "
-                         f"fixtures, auto-settled {res['settled']}.")
+        await msg.answer(f"✅ Synced {res['fixtures']} fixtures, "
+                         f"auto-settled {res['settled']}.")
 
 
 # ----------------------------------------------------------------------
@@ -602,9 +548,14 @@ async def sync_cmd(msg: Message):
 # ----------------------------------------------------------------------
 CASCADE = [           # (delay since bridge_clicked_at, step index, text fn)
     (2 * HOUR, 1, lambda u, n: T.CASCADE_2H),
-    (24 * HOUR, 2, lambda u, n: T.CASCADE_24H.format(
-        name=u["name"], n_converted=max(n, 12),
-        accuracy=int(100 * u["correct"] / u["total"]) if u["total"] else 60)),
+    (24 * HOUR, 2, lambda u, n: (
+        T.CASCADE_24H.format(
+            name=u["name"], n_converted=n,
+            accuracy=int(100 * u["correct"] / u["total"]) if u["total"] else 60)
+        if n >= 5 else            # real social proof only — never invent numbers
+        T.CASCADE_24H_EARLY.format(
+            name=u["name"],
+            accuracy=int(100 * u["correct"] / u["total"]) if u["total"] else 60))),
     (5 * DAY, 3, lambda u, n: T.CASCADE_5D.format(name=u["name"])),
     (7 * DAY, 4, lambda u, n: T.CASCADE_7D.format(team=u["team"] or "Your team")),
 ]
@@ -614,6 +565,27 @@ async def scheduler():
     while True:
         try:
             now = int(time.time())
+
+            # 0) weekly league reset (Mon 00:00 UTC): announce podium, zero week
+            week_start = int(await db.meta_get("week_start", "0"))
+            if not week_start:
+                # align to last Monday 00:00 UTC
+                g = time.gmtime(now)
+                week_start = now - g.tm_wday * DAY - g.tm_hour * HOUR \
+                    - g.tm_min * 60 - g.tm_sec
+                await db.meta_set("week_start", str(week_start))
+            elif now - week_start >= 7 * DAY:
+                top = await db.weekly_top(10)
+                if top:
+                    podium = "\n".join(
+                        f"{i+1}. {r['name']} — {r['week_correct']}/{r['week_total']}"
+                        for i, r in enumerate(top))
+                    text = T.WEEKLY_PODIUM.format(podium=podium)
+                    for u in await db.all_users("team IS NOT NULL AND blocked=0"):
+                        await safe_send_photo(u["tg_id"], "podium.png", text)
+                        await asyncio.sleep(0.05)
+                await db.weekly_reset()
+                await db.meta_set("week_start", str(week_start + 7 * DAY))
 
             # 0a) fixtures auto-sync every 30 min (also auto-settles)
             if now - int(await db.meta_get("last_sync", "0")) >= 1800:
@@ -627,7 +599,7 @@ async def scheduler():
                 items = await fetch_news(3)
                 if items:
                     text = format_news(items)
-                    for u in await db.all_users("team IS NOT NULL"):
+                    for u in await db.all_users("team IS NOT NULL AND blocked=0"):
                         await safe_send(u["tg_id"], text,
                                         disable_web_page_preview=True)
                         await asyncio.sleep(0.05)
@@ -638,13 +610,15 @@ async def scheduler():
                     "announced=0 AND result IS NULL AND kickoff BETWEEN ? AND ?",
                     (now, now + DAY)):
                 hours = max(1, (m["kickoff"] - now) // HOUR)
-                for u in await db.all_users("team IS NOT NULL"):
+                for u in await db.all_users("team IS NOT NULL AND blocked=0"):
                     if u["team"] in (m["t1"], m["t2"]):
                         txt = T.NEW_MATCH_TEAM.format(
                             team=u["team"], t1=m["t1"], t2=m["t2"], hours=hours)
                     else:
                         txt = T.NEW_MATCH.format(t1=m["t1"], t2=m["t2"], hours=hours)
-                    await safe_send(u["tg_id"], txt, reply_markup=kb_pick(m))
+                    await safe_send_photo(
+                        u["tg_id"], f"new_match_{m['id'] % 2 + 1}.png",
+                        txt, reply_markup=kb_pick(m))
                     await asyncio.sleep(0.05)
                 await db.mark_announced(m["id"])
 
@@ -654,16 +628,17 @@ async def scheduler():
                     (now, now + 3 * HOUR)):
                 hours = max(1, (m["kickoff"] - now) // HOUR)
                 for u in await db.all_users(
-                        "registered=0 AND team IN (?,?) AND last_matchday_push < ?",
+                        "registered=0 AND blocked=0 AND team IN (?,?) AND last_matchday_push < ?",
                         (m["t1"], m["t2"], now - 2 * DAY)):
                     await fire_bridge(u["tg_id"], T.TRIGGER_MATCHDAY.format(
-                        team=u["team"], hours=hours), T.MATCHDAY_BUTTON)
+                        team=u["team"], hours=hours), T.MATCHDAY_BUTTON,
+                        img="matchday.png")
                     await db.set_user(u["tg_id"], last_matchday_push=now)
 
             # 3) drip cascade for bridge-shown, unregistered users
             n_conv = await db.converted_count()
             for u in await db.all_users(
-                    "registered=0 AND bridge_clicked_at IS NOT NULL"):
+                    "registered=0 AND blocked=0 AND bridge_clicked_at IS NOT NULL"):
                 for delay, step, fn in CASCADE:
                     if u["cascade_step"] < step and \
                             now - u["bridge_clicked_at"] >= delay:
@@ -673,30 +648,21 @@ async def scheduler():
                         await db.set_user(u["tg_id"], cascade_step=step)
                         break    # one step per tick
 
-            # 3.5) verification nudge: 24h in, no phone, no email — one time
-            for u in await db.all_users(
-                    "team IS NOT NULL AND phone IS NULL AND email IS NULL "
-                    "AND verify_nudged=0 AND created_at < ?",
-                    (now - DAY,)):
-                await safe_send(u["tg_id"],
-                                T.VERIFY_NUDGE.format(name=u["name"]),
-                                reply_markup=kb_contact())
-                await db.set_user(u["tg_id"], verify_nudged=1)
-
             # 4) re-hook quiet predictors: 3+ days since last pick
             upcoming = await db.matches_where(
                 "result IS NULL AND kickoff > ?", (now,))
             for u in await db.all_users(
-                    "last_pick_at > 0 AND last_pick_at < ? AND rehooked=0",
+                    "last_pick_at > 0 AND last_pick_at < ? AND rehooked=0 AND blocked=0",
                     (now - 3 * DAY,)):
                 kb = kb_pick(upcoming[0]) if upcoming else kb_webapp()
-                await safe_send(u["tg_id"],
-                                T.REHOOK.format(name=u["name"]), reply_markup=kb)
+                await safe_send_photo(u["tg_id"], "rehook.png",
+                                      T.REHOOK.format(name=u["name"]),
+                                      reply_markup=kb)
                 await db.set_user(u["tg_id"], rehooked=1)
 
             # 5) 4h reminder for users without a team
             for u in await db.all_users(
-                    "team IS NULL AND reminded_team=0 AND created_at < ?",
+                    "team IS NULL AND reminded_team=0 AND blocked=0 AND created_at < ?",
                     (now - 4 * HOUR,)):
                 await safe_send(u["tg_id"],
                                 T.REMIND_NO_TEAM.format(name=u["name"]),
@@ -719,7 +685,7 @@ from urllib.parse import parse_qsl
 
 
 def verify_init_data(init_data: str):
-    """Returns tg user id if signature is valid, else None."""
+    """Returns tg user id if signature is valid and fresh, else None."""
     try:
         data = dict(parse_qsl(init_data, keep_blank_values=True))
         received_hash = data.pop("hash")
@@ -729,6 +695,9 @@ def verify_init_data(init_data: str):
         calc = hmac.new(secret, check_string.encode(),
                         hashlib.sha256).hexdigest()
         if not hmac.compare_digest(calc, received_hash):
+            return None
+        # replay protection: initData older than 24h is rejected
+        if int(time.time()) - int(data.get("auth_date", 0)) > DAY:
             return None
         return json.loads(data["user"])["id"]
     except Exception:
@@ -762,6 +731,7 @@ async def api_me(request):
     return web.json_response({
         "name": u["name"], "team": u["team"],
         "correct": u["correct"], "total": u["total"], "streak": u["streak"],
+        "week_correct": u["week_correct"], "week_total": u["week_total"],
         "accuracy": round(100 * u["correct"] / u["total"]) if u["total"] else None,
         "registered": bool(u["registered"]),
     })
@@ -793,6 +763,18 @@ async def api_predict(request):
             or pick not in ("1", "X", "2"):
         return web.json_response({"error": "match closed"}, status=400)
     first = await db.save_prediction(uid, mid, pick)
+    # the funnel must not fork: a first pick made in the mini app gets the
+    # same verification ask as an in-bot pick — otherwise the whole web-app
+    # path silently skips phone/email capture
+    if first:
+        u = await db.get_user(uid)
+        if u and not u["phone"] and not u["email"]:
+            label = {"1": m["t1"], "X": "Draw", "2": m["t2"]}[pick]
+            ask = T.PREDICTION_SAVED.format(pick=label)
+            if PRIVACY_URL:
+                ask += T.PRIVACY_FOOTNOTE.format(url=PRIVACY_URL)
+            await safe_send(uid, ask, reply_markup=kb_contact(),
+                            disable_web_page_preview=True)
     return web.json_response({"ok": True, "first_prediction": first})
 
 
@@ -811,16 +793,25 @@ async def api_leaderboard(request):
 async def postback(request: web.Request):
     if request.query.get("secret") != POSTBACK_SECRET:
         return web.Response(status=403, text="forbidden")
-    uid = int(request.query.get("uid", 0))
+    try:
+        uid = int(request.query.get("uid", ""))
+    except ValueError:
+        return web.Response(status=400, text="bad uid")
     event = request.query.get("event", "reg")
     user = await db.get_user(uid)
     if not user:
         return web.Response(status=404, text="unknown uid")
     if event == "reg" and not user["registered"]:
         await db.set_user(uid, registered=1)
-        await meta_event("CompleteRegistration", uid)
-        await safe_send(uid, T.REG_CONGRATS.format(team=user["team"] or "Your team"))
-        log.info("registration postback uid=%s", uid)
+        await safe_send_photo(uid, "streak_bonus.png",
+                              T.REG_CONGRATS.format(team=user["team"] or "Your team"))
+        await send_capi("CompleteRegistration", uid, user["source"])
+        log.info("registration postback uid=%s source=%s", uid, user["source"])
+    elif event in ("dep", "ftd", "deposit"):
+        await db.set_user(uid, registered=1)            # dep implies reg
+        await safe_send_photo(uid, "dep_win.png", T.DEP_CONGRATS)
+        await send_capi("Purchase", uid, user["source"])
+        log.info("deposit postback uid=%s source=%s", uid, user["source"])
     return web.Response(text="ok")
 
 

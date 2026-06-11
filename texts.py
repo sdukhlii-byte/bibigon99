@@ -14,11 +14,18 @@ START = (
     "<b>Who takes the World Cup this year?</b> 🏆"
 )
 
+# ad scent: shown when /start payload begins with "ig" (Instagram/Meta traffic)
 START_IG = (
-    "Instagram crew — you found it 👊 This week's <b>500 USDT prize pool</b> "
-    "is live, and you're in before most people even know it exists.\n\n"
-    "One question and you're in the game:\n"
+    "Instagram crew — you found it 👊\n\n"
+    "This week's <b>500 USDT prize pool</b> is live, and you're in before "
+    "most people even know it exists.\n\n"
+    "One question and I'll set everything up:\n"
     "<b>Who takes the World Cup this year?</b> 🏆"
+)
+
+WELCOME_BACK = (
+    "Back in the game 👊 Still riding with <b>{team}</b>.\n\n"
+    "Your league card: /mystats · next matches: /schedule · live hub below 👇"
 )
 
 TEAM_SAVED = (
@@ -68,6 +75,12 @@ PREDICTION_SAVED = (
 BTN_VERIFY_CONTACT = "✅ Verify for prizes"
 BTN_VERIFY_SKIP = "Skip for now"
 
+# appended to the verification ask when PRIVACY_URL is set (GDPR, EU traffic)
+PRIVACY_FOOTNOTE = (
+    "\n\n<i>By verifying you agree to receive league updates. "
+    "Privacy policy: {url} — unsubscribe anytime with /skip.</i>"
+)
+
 CONTACT_SAVED = (
     "Verified ✅ You're prize-eligible.\n\n"
     "I'll ping you the moment the final whistle blows. Good luck — "
@@ -102,35 +115,13 @@ NEWS_EMPTY = "Couldn't reach the newsroom right now — try again in a minute."
 MYSTATS = (
     "📊 <b>Your league card</b>\n\n"
     "Team: <b>{team}</b>\n"
-    "Picks: <b>{total}</b> · Correct: <b>{correct}</b> ({accuracy}%)\n"
+    "This week: <b>{week_correct}/{week_total}</b> correct (prize window)\n"
+    "All-time: <b>{correct}/{total}</b> ({accuracy}%)\n"
     "Current streak: <b>{streak}</b> 🔥\n"
     "League rank: <b>#{rank}</b>\n\n"
     "Top 10 split the weekly 500 USDT pool. Keep climbing."
 )
-MYSTATS_EMPTY = "No picks yet — your card is empty. Fix that: tap 🎯 Make a Pick"
-
-# ---------- persistent main menu ----------
-
-BTN_MENU_PICK = "🎯 Make a Pick"
-BTN_MENU_STATS = "🏆 My Stats"
-BTN_MENU_NEWS = "⚽ News"
-BTN_MENU_HUB = "🚀 Live Hub"
-
-# ---------- proactive verification (onboarding + nudge) ----------
-
-VERIFY_PUSH = (
-    "You're officially in the league 🏆\n\n"
-    "One thing separates players from spectators here: the weekly "
-    "<b>500 USDT prize pool</b> only pays out to <b>verified</b> players.\n\n"
-    "One tap below — and every point you score counts toward real money:"
-)
-
-VERIFY_NUDGE = (
-    "{name}, quick one — you're in the league, but you're "
-    "<b>not prize-eligible yet</b> 👀\n\n"
-    "If your week ends in the top 10, the 500 USDT pool splits "
-    "<i>without you</i>. One tap fixes it:"
-)
+MYSTATS_EMPTY = "No picks yet — your card is empty. Fix that: /schedule"
 
 EMAIL_SAVED = (
     "Done ✅ You're prize-eligible.\n\n"
@@ -201,6 +192,15 @@ CASCADE_24H = (
     "They're getting paid for what you're doing for free. That math should bother you."
 )
 
+# used while real converted count is still small — specificity without invention
+CASCADE_24H_EARLY = (
+    "Quick stat from your league, {name}:\n\n"
+    "You're sitting at <b>{accuracy}% accuracy</b> — calling results for free "
+    "that others get paid for.\n\n"
+    "The welcome package turns the exact same reads into real numbers: "
+    "×2.25 on the first deposit + cashback either way. That math should interest you."
+)
+
 CASCADE_5D = (
     "Okay {name}, no hype, just numbers.\n\n"
     "Minimum entry: <b>20 USDT</b>. That's a pizza.\n"
@@ -221,6 +221,22 @@ REG_CONGRATS = (
     "It activates with your first deposit — from <b>20 USDT</b>. The stack: "
     "<b>×2.25 on your bankroll + 80 free spins + cashback safety net</b>.\n\n"
     "{team} play soon — get it done before kickoff."
+)
+
+DEP_CONGRATS = (
+    "Bonus activated 🔥 Your bankroll just played <b>×2.25</b>, free spins "
+    "are loading, cashback is armed.\n\n"
+    "Your league picks now have real weight behind them. Same reads — "
+    "different stakes. Good luck out there 🎯"
+)
+
+# ---------- weekly league reset ----------
+
+WEEKLY_PODIUM = (
+    "🏆 <b>Week closed — here's your Top 10:</b>\n\n"
+    "{podium}\n\n"
+    "Winners: check your DMs about the prize pool split.\n"
+    "Scores are reset — <b>this week is anyone's game</b>. First match: /schedule 🎯"
 )
 
 # ---------- buttons ----------

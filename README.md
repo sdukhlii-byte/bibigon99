@@ -23,6 +23,10 @@ TG Ads → /start → team pick → first prediction (in-bot)
 | `TRACKER_URL` | `https://track.yourdomain.com/CAMPAIGN_ID` (Keitaro campaign) |
 | `WEBAPP_URL` | `https://t.me/YourBot/app` |
 | `POSTBACK_SECRET` | any long random string |
+| `DB_PATH` | `/data/funnel.db` — **attach a Railway volume and point here**, or every redeploy wipes the database |
+| `META_PIXEL_ID` | Meta Pixel id — enables server-side CAPI events (Lead / CompleteRegistration / Purchase) |
+| `META_CAPI_TOKEN` | Meta Conversions API access token |
+| `PRIVACY_URL` | privacy policy link — appends a GDPR consent line to the verification ask (EU traffic) |
 | `FOOTBALL_API_KEY` | api-sports.io key — enables fixture auto-sync (free: 100 req/day, sync uses ~48) |
 | `FOOTBALL_LEAGUE_ID` | optional, default `1` (FIFA World Cup) |
 | `FOOTBALL_SEASON` | optional, default `2026` |
@@ -69,6 +73,29 @@ Wire the site/affiliate platform to call on successful registration:
 GET https://<your-domain>/postback?uid={tg_id}&event=reg&secret=<POSTBACK_SECRET>
 ```
 
+For first deposits add a second outgoing postback with `event=dep` — the bot
+sends the bonus-activated message and fires a CAPI `Purchase` event.
+
+## Ad attribution + Meta CAPI
+
+- Every ad link carries its campaign: `t.me/YourBot?start=ig_wc_lal_001`.
+  The payload is stored as the user's `source` (first touch wins); `/stats`
+  shows a **By source: users / regs** breakdown per ad set.
+- Payloads starting with `ig` switch the greeting to the Instagram-scented
+  variant (`START_IG` in texts.py) — ad scent matches the first message.
+- With `META_PIXEL_ID` + `META_CAPI_TOKEN` set, the bot sends server events:
+  `Lead` on phone/email verification, `CompleteRegistration` on reg postback,
+  `Purchase` on dep postback. Matching via hashed `external_id`; `event_id`
+  dedupes against the browser pixel on the prelanding.
+
+## Weekly league
+
+Copy promises a weekly 500 USDT pool — the code now delivers a weekly window:
+`week_correct/week_total` drive the leaderboard and `/mystats` rank; every
+Monday 00:00 UTC the scheduler broadcasts the Top 10 podium and resets the
+weekly counters (all-time stats stay). **Actually pay the winners and post
+proof — that broadcast is your strongest social-proof asset.**
+
 `uid` arrives at the prelanding as a query param (`?uid=...`) — pass it through
 the reg form as sub_id / clickid. On postback the bot:
 stops the cascade, sends the congrats + deposit-nudge message.
@@ -111,3 +138,24 @@ verification. A daily news digest goes to all users at `DIGEST_HOUR_UTC`
 `/stats` ratios to keep: start→team 80%+, team→prediction 40%+,
 prediction→email 25%+, bridge→prelanding clicks 15%+, prelanding→reg 20%+.
 Fix the single worst ratio each week, nothing else.
+
+## Media (funnel-stage creatives)
+
+`media/` ships with one creative per funnel moment — the bot attaches it
+automatically; if a file is missing it silently falls back to text:
+
+| File | Fires on | Why this one |
+|---|---|---|
+| `start.png` | /start greeting | hero shot, **no money imagery** — safe ad scent for Meta/TG ads |
+| `new_match_1.png` / `new_match_2.png` | match announcements | rotate by match id — kills banner blindness |
+| `matchday.png` | matchday bridge (<3h) | rain + intensity = urgency frame |
+| `streak_bonus.png` | streak bridge + reg congrats | chest/coins appear only AFTER engagement, never in ads |
+| `rehook.png` | quiet-predictor re-hook | phone glow = "the bot is calling you" |
+| `podium.png` | weekly Top-10 broadcast | trophy + prizes = the proof moment |
+| `dep_win.png` | deposit postback | gold payoff at the deepest stage |
+
+**Rule: creatives with coins/treasure (streak_bonus, dep_win, podium) stay
+INSIDE the bot.** In Meta/Telegram ad creatives use only start/new_match/
+matchday/rehook style imagery — a free prediction league, not gambling.
+Results, cascade and emails stay text-only on purpose: nurture should feel
+personal, not like a banner feed.
