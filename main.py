@@ -41,9 +41,9 @@ POSTBACK_SECRET = os.getenv("POSTBACK_SECRET", "change-me")
 META_PIXEL_ID = os.getenv("META_PIXEL_ID", "")        # Meta CAPI: server-side events
 META_CAPI_TOKEN = os.getenv("META_CAPI_TOKEN", "")
 PRIVACY_URL = os.getenv("PRIVACY_URL", "")            # GDPR notice link (EU traffic)
-FOOTBALL_API_KEY = os.getenv("FOOTBALL_API_KEY", "")   # api-sports.io (API-Football v3) key
-FOOTBALL_LEAGUE_ID = os.getenv("FOOTBALL_LEAGUE_ID", "1")   # 1 = FIFA World Cup
-FOOTBALL_SEASON = os.getenv("FOOTBALL_SEASON", "2026")
+FOOTBALL_API_KEY = os.getenv("FOOTBALL_API_KEY", "")   # legacy, no longer required
+ESPN_LEAGUE = os.getenv("ESPN_LEAGUE", "fifa.world")   # ESPN soccer league slug
+SYNC_LOOKAHEAD_DAYS = int(os.getenv("SYNC_LOOKAHEAD_DAYS", 30))
 NEWS_RSS_URL = os.getenv("NEWS_RSS_URL",
                          "https://feeds.bbci.co.uk/sport/football/rss.xml")
 DIGEST_HOUR_UTC = int(os.getenv("DIGEST_HOUR_UTC", 9))
@@ -489,56 +489,57 @@ async def mystats_cmd(msg: Message):
         streak=u["streak"], rank=await db.user_rank(msg.from_user.id)))
 
 
-FINISHED_STATUSES = {"FT", "AET", "PEN"}   # api-sports fixture status codes
-
-
 async def sync_fixtures() -> dict:
-    """Pull World Cup fixtures/results from API-Sports v3 and auto-settle.
+    """Pull World Cup fixtures/results from ESPN's free scoreboard API and
+    auto-settle finished matches. No API key, no paid seasons.
     Returns a summary dict for logging / the /sync admin command."""
-    if not FOOTBALL_API_KEY:
-        return {"error": "FOOTBALL_API_KEY is not set"}
+    start = time.strftime("%Y%m%d", time.gmtime(int(time.time()) - 2 * DAY))
+    end = time.strftime("%Y%m%d",
+                        time.gmtime(int(time.time()) + SYNC_LOOKAHEAD_DAYS * DAY))
+    url = (f"https://site.api.espn.com/apis/site/v2/sports/soccer/"
+           f"{ESPN_LEAGUE}/scoreboard")
     try:
         async with aiohttp.ClientSession() as s:
-            async with s.get(
-                    "https://v3.football.api-sports.io/fixtures",
-                    params={"league": FOOTBALL_LEAGUE_ID,
-                            "season": FOOTBALL_SEASON},
-                    headers={"x-apisports-key": FOOTBALL_API_KEY},
-                    timeout=20) as resp:
+            async with s.get(url, params={"dates": f"{start}-{end}",
+                                          "limit": 350},
+                             timeout=20) as resp:
+                if resp.status != 200:
+                    return {"error": f"ESPN HTTP {resp.status}"}
                 data = await resp.json()
     except Exception as e:
         log.warning("fixtures sync failed: %s", e)
         return {"error": str(e)}
-    if data.get("errors"):
-        log.warning("api-sports errors: %s", data["errors"])
-        return {"error": str(data["errors"])}
 
     from datetime import datetime
     upserted = settled = 0
-    for row in data.get("response", []):
+    for ev in data.get("events", []):
         try:
-            fx, teams, goals = row["fixture"], row["teams"], row["goals"]
-            t1 = teams["home"]["name"] or "TBD"
-            t2 = teams["away"]["name"] or "TBD"
-            kickoff = int(datetime.fromisoformat(fx["date"]).timestamp())
-            mid = await db.upsert_match_ext(str(fx["id"]), t1, t2, kickoff)
+            comp = ev["competitions"][0]
+            home = next(c for c in comp["competitors"]
+                        if c.get("homeAway") == "home")
+            away = next(c for c in comp["competitors"]
+                        if c.get("homeAway") == "away")
+            t1 = home["team"].get("displayName") or "TBD"
+            t2 = away["team"].get("displayName") or "TBD"
+            kickoff = int(datetime.fromisoformat(
+                ev["date"].replace("Z", "+00:00")).timestamp())
+            mid = await db.upsert_match_ext(str(ev["id"]), t1, t2, kickoff)
             upserted += 1
-            if fx["status"]["short"] in FINISHED_STATUSES:
+            if ev.get("status", {}).get("type", {}).get("completed"):
                 local = await db.get_match(mid)
-                if local and not local["result"] \
-                        and goals.get("home") is not None:
-                    if teams["home"].get("winner"):
+                if local and not local["result"]:
+                    hs, as_ = int(home.get("score", 0)), int(away.get("score", 0))
+                    if home.get("winner"):
                         res = "1"
-                    elif teams["away"].get("winner"):
+                    elif away.get("winner"):
                         res = "2"
                     else:
-                        res = "X"
-                    await do_settle(mid, res,
-                                    f"{goals['home']}:{goals['away']}")
+                        res = "1" if hs > as_ else ("2" if as_ > hs else "X")
+                    await do_settle(mid, res, f"{hs}:{as_}")
                     settled += 1
-                    log.info("auto-settled match %s", mid)
+                    log.info("auto-settled match %s (%s:%s)", mid, hs, as_)
         except Exception:
-            log.exception("bad fixture row")
+            log.exception("bad ESPN event row")
     return {"fixtures": upserted, "settled": settled}
 
 
