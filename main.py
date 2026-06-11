@@ -47,6 +47,8 @@ SYNC_LOOKAHEAD_DAYS = int(os.getenv("SYNC_LOOKAHEAD_DAYS", 30))
 ANNOUNCE_GAP = int(os.getenv("ANNOUNCE_GAP_HOURS", 6)) * 3600  # min gap between announce pushes per user
 SYNC_INTERVAL_MIN = int(os.getenv("SYNC_INTERVAL_MIN", 30))    # idle ESPN poll cadence
 LIVE_SYNC_MIN = int(os.getenv("LIVE_SYNC_MIN", 3))             # cadence while a match is in play
+VIP_PRICE_STARS = int(os.getenv("VIP_PRICE_STARS", 250))       # Telegram Stars / month
+VIP_CHANNEL_INVITE = os.getenv("VIP_CHANNEL_INVITE", "")       # private VIP channel invite link
 NEWS_RSS_URL = os.getenv("NEWS_RSS_URL",
                          "https://feeds.bbci.co.uk/sport/football/rss.xml")
 DIGEST_HOUR_UTC = int(os.getenv("DIGEST_HOUR_UTC", 9))
@@ -202,8 +204,19 @@ async def start(msg: Message):
     payload = parts[1].strip()[:64] if len(parts) > 1 else None
 
     existing = await db.get_user(msg.from_user.id)
+    referrer = None
+    if payload and payload.startswith("ref_"):
+        try:
+            rid = int(payload[4:])
+            if rid != msg.from_user.id:
+                referrer = rid
+        except ValueError:
+            pass
+        payload = "referral"     # keep /stats clean of per-user payloads
     await db.upsert_user(msg.from_user.id, msg.from_user.first_name or "mate",
                          source=payload)
+    if referrer and not existing:      # first touch only, no self-invites
+        await db.set_user(msg.from_user.id, referrer_id=referrer)
 
     # returning player with a team: don't reset them to the quiz
     if existing and existing["team"]:
@@ -267,6 +280,12 @@ async def pick(cb: CallbackQuery):
     label = {"1": m["t1"], "X": "Draw", "2": m["t2"]}[choice]
     await cb.answer(f"Locked: {label} 🎯")
 
+    if first:
+        rid, gave = await db.credit_referral(cb.from_user.id)
+        if rid:
+            await safe_send(rid, T.REF_JOINED.format(
+                name=cb.from_user.first_name or "Your friend",
+                points="+1 league point" if gave else "no points (weekly cap)"))
     user = await db.get_user(cb.from_user.id)
     if first and not user["phone"] and not user["email"]:
         ask = T.PREDICTION_SAVED.format(pick=label)
@@ -366,9 +385,10 @@ async def do_settle(mid: int, result: str, score: str) -> int:
     for uid, ok in rows:
         u = await db.get_user(uid)
         if ok:
+            kb = kb_bridge(uid, T.BTN_CASH_READ) if not u["registered"] else None
             await safe_send(uid, T.RESULT_WIN.format(
                 t1=m["t1"], t2=m["t2"], score=score,
-                points=10, streak=u["streak"]))
+                points=10, streak=u["streak"]), reply_markup=kb)
             if u["streak"] >= 3 and not u["registered"]:
                 await fire_bridge(uid, T.TRIGGER_STREAK.format(
                     name=u["name"], streak=u["streak"]), T.BRIDGE_BUTTON,
@@ -409,6 +429,51 @@ async def stats(msg: Message):
         lines.append("\n<b>By source</b> (users / regs):")
         lines += [f"• {src}: {n} / {regs or 0}" for src, n, regs in by_src]
     await msg.answer("\n".join(lines))
+
+
+@r.message(Command("vip"))
+async def vip_cmd(msg: Message):
+    if not VIP_CHANNEL_INVITE:
+        await msg.answer("VIP launches soon — stay tuned 👀")
+        return
+    u = await db.get_user(msg.from_user.id)
+    if u and u["vip"]:
+        await msg.answer(T.VIP_ALREADY.format(link=VIP_CHANNEL_INVITE),
+                         disable_web_page_preview=True)
+        return
+    from aiogram.types import LabeledPrice
+    await bot.send_invoice(
+        msg.chat.id, title="VIP Predictor Pass — 30 days",
+        description=T.VIP_INVOICE_DESC,
+        payload="vip_month", currency="XTR", provider_token="",
+        prices=[LabeledPrice(label="VIP Pass (30 days)",
+                             amount=VIP_PRICE_STARS)])
+
+
+@r.pre_checkout_query()
+async def pre_checkout(q):
+    await q.answer(ok=True)
+
+
+@r.message(F.successful_payment)
+async def vip_paid(msg: Message):
+    await db.set_user(msg.from_user.id, vip=1)
+    await msg.answer(T.VIP_WELCOME.format(link=VIP_CHANNEL_INVITE),
+                     disable_web_page_preview=True)
+    log.info("VIP purchase uid=%s", msg.from_user.id)
+
+
+@r.message(Command("invite"))
+async def invite_cmd(msg: Message):
+    from urllib.parse import quote
+    me = await bot.get_me()
+    link = f"https://t.me/{me.username}?start=ref_{msg.from_user.id}"
+    share = ("https://t.me/share/url?url=" + quote(link) + "&text="
+             + quote(T.INVITE_SHARE_TEXT))
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=T.BTN_INVITE_SHARE, url=share)]])
+    await msg.answer(T.INVITE.format(link=link), reply_markup=kb,
+                     disable_web_page_preview=True)
 
 
 @r.message(Command("export"))
@@ -613,7 +678,8 @@ CASCADE = [           # (delay since bridge_clicked_at, step index, text fn)
             name=u["name"],
             accuracy=int(100 * u["correct"] / u["total"]) if u["total"] else 60))),
     (5 * DAY, 3, lambda u, n: T.CASCADE_5D.format(name=u["name"])),
-    (7 * DAY, 4, lambda u, n: T.CASCADE_7D.format(team=u["team"] or "Your team")),
+    (7 * DAY, 4, lambda u, n: T.CASCADE_7D.format(team=u["team"] or "Your team")
+        + T.CASCADE_VIP_PS),
 ]
 
 
@@ -642,6 +708,21 @@ async def scheduler():
                         await asyncio.sleep(0.05)
                 await db.weekly_reset()
                 await db.meta_set("week_start", str(week_start + 7 * DAY))
+
+            # 0b) prize proximity: midweek, tell ranks 11-20 how close the
+            # money is — nothing retains like an almost-won prize
+            if now - week_start >= 4 * DAY and \
+                    await db.meta_get("proximity_week", "") != str(week_start):
+                top = await db.weekly_top(20)
+                if len(top) > 10:
+                    threshold = top[9]["week_correct"]
+                    for i, r in enumerate(top[10:], start=11):
+                        gap = max(1, threshold - r["week_correct"] + 1)
+                        await safe_send(r["tg_id"], T.PROXIMITY.format(
+                            rank=i, gap=gap,
+                            calls="call" if gap == 1 else "calls"))
+                        await asyncio.sleep(0.05)
+                await db.meta_set("proximity_week", str(week_start))
 
             # 0a) fixtures auto-sync (also auto-settles + win/loss pushes).
             # While a match is in play the hub promises LIVE scores — poll
@@ -728,6 +809,22 @@ async def scheduler():
                                       T.REHOOK.format(name=u["name"]),
                                       reply_markup=kb)
                 await db.set_user(u["tg_id"], rehooked=1)
+
+            # 4b) deposit cascade: registered but no FTD — warmest pool in
+            # the whole funnel, every touch here is worth $150 of payout
+            for delay, step, key in ((20 * HOUR, 1, "DEP_CASCADE_20H"),
+                                     (68 * HOUR, 2, "DEP_CASCADE_68H")):
+                for u in await db.all_users(
+                        "registered=1 AND deposited=0 AND blocked=0 "
+                        "AND dep_cascade_step < ? AND registered_at > 0 "
+                        "AND registered_at < ?", (step, now - delay)):
+                    await safe_send_photo(
+                        u["tg_id"], "dep_win.png" if step == 2 else None,
+                        getattr(T, key).format(name=u["name"],
+                                               team=u["team"] or "Your team"),
+                        reply_markup=kb_bridge(u["tg_id"], T.BRIDGE_BUTTON))
+                    await db.set_user(u["tg_id"], dep_cascade_step=step)
+                    await asyncio.sleep(0.05)
 
             # 5a) one-time Live Hub nudge: picks in chat, never opened the app
             for u in await db.all_users(
@@ -848,6 +945,11 @@ async def api_predict(request):
     # same verification ask as an in-bot pick — otherwise the whole web-app
     # path silently skips phone/email capture
     if first:
+        rid, gave = await db.credit_referral(uid)
+        if rid:
+            await safe_send(rid, T.REF_JOINED.format(
+                name=(await db.get_user(uid))["name"],
+                points="+1 league point" if gave else "no points (weekly cap)"))
         u = await db.get_user(uid)
         if u and not u["phone"] and not u["email"]:
             label = {"1": m["t1"], "X": "Draw", "2": m["t2"]}[pick]
@@ -883,7 +985,7 @@ async def postback(request: web.Request):
     if not user:
         return web.Response(status=404, text="unknown uid")
     if event == "reg" and not user["registered"]:
-        await db.set_user(uid, registered=1)
+        await db.set_user(uid, registered=1, registered_at=int(time.time()))
         # truth-checked urgency: only claim a kickoff if one actually exists
         team, congrats = user["team"], None
         if team:
@@ -899,7 +1001,7 @@ async def postback(request: web.Request):
         await send_capi("CompleteRegistration", uid, user["source"])
         log.info("registration postback uid=%s source=%s", uid, user["source"])
     elif event in ("dep", "ftd", "deposit"):
-        await db.set_user(uid, registered=1)            # dep implies reg
+        await db.set_user(uid, registered=1, deposited=1)   # dep implies reg
         await safe_send_photo(uid, "dep_win.png", T.DEP_CONGRATS)
         await send_capi("Purchase", uid, user["source"])
         log.info("deposit postback uid=%s source=%s", uid, user["source"])

@@ -72,7 +72,15 @@ async def init():
                          ("capi_lead_sent", "INTEGER DEFAULT 0"),
                          ("last_announce_push", "INTEGER DEFAULT 0"),
                          ("last_webapp_at", "INTEGER DEFAULT 0"),
-                         ("webapp_nudged", "INTEGER DEFAULT 0")]:
+                         ("webapp_nudged", "INTEGER DEFAULT 0"),
+                         ("referrer_id", "INTEGER"),
+                         ("referrals", "INTEGER DEFAULT 0"),
+                         ("ref_week_points", "INTEGER DEFAULT 0"),
+                         ("ref_credited", "INTEGER DEFAULT 0"),
+                         ("deposited", "INTEGER DEFAULT 0"),
+                         ("registered_at", "INTEGER DEFAULT 0"),
+                         ("dep_cascade_step", "INTEGER DEFAULT 0"),
+                         ("vip", "INTEGER DEFAULT 0")]:
             try:
                 await db.execute(f"ALTER TABLE users ADD COLUMN {col} {ddl}")
             except Exception:
@@ -271,8 +279,9 @@ async def leaderboard(limit: int = 20):
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
             "SELECT name, team, week_correct AS correct, week_total AS total, "
-            "streak FROM users WHERE week_total > 0 "
-            "ORDER BY week_correct DESC, week_total ASC LIMIT ?", (limit,))
+            "streak FROM users WHERE week_total > 0 OR last_pick_at > 0 "
+            "ORDER BY week_correct DESC, week_total ASC, last_pick_at DESC "
+            "LIMIT ?", (limit,))
         return await cur.fetchall()
 
 
@@ -288,8 +297,43 @@ async def weekly_top(limit: int = 10):
 
 async def weekly_reset():
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE users SET week_correct=0, week_total=0")
+        await db.execute("UPDATE users SET week_correct=0, week_total=0, "
+                         "ref_week_points=0")
         await db.commit()
+
+
+async def credit_referral(invitee: int):
+    """First pick of an invited user: +1 weekly point to the referrer
+    (capped at 3/week so the league can't be farmed). Returns
+    (referrer_id, point_given) or (None, False)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT referrer_id, ref_credited FROM users WHERE tg_id=?",
+            (invitee,))
+        row = await cur.fetchone()
+        if not row or not row["referrer_id"] or row["ref_credited"]:
+            return None, False
+        rid = row["referrer_id"]
+        await db.execute("UPDATE users SET ref_credited=1 WHERE tg_id=?",
+                         (invitee,))
+        cur = await db.execute(
+            "SELECT ref_week_points FROM users WHERE tg_id=?", (rid,))
+        r = await cur.fetchone()
+        if r is None:
+            await db.commit()
+            return None, False
+        give = r["ref_week_points"] < 3
+        if give:
+            await db.execute(
+                "UPDATE users SET referrals=referrals+1, "
+                "week_correct=week_correct+1, ref_week_points=ref_week_points+1 "
+                "WHERE tg_id=?", (rid,))
+        else:
+            await db.execute(
+                "UPDATE users SET referrals=referrals+1 WHERE tg_id=?", (rid,))
+        await db.commit()
+        return rid, give
 
 
 async def user_picks(uid: int):

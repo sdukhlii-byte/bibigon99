@@ -247,6 +247,68 @@ DEP_CONGRATS = (
     "different stakes. Good luck out there 🎯"
 )
 
+DEP_CASCADE_20H = (
+    "{name}, your bonus is sitting there fully loaded — and unused 🔋\n\n"
+    "The math, one more time: <b>20 USDT in → 45 USDT to play with</b> "
+    "(×2.25), plus 80 free spins, plus cashback if the week goes sideways.\n\n"
+    "You already did the hard part (the account). This part takes 2 minutes."
+)
+
+DEP_CASCADE_68H = (
+    "Last note about the bonus, {name} — then I drop it 🤝\n\n"
+    "{team} keep playing either way. The only question is whether your "
+    "reads keep being free entertainment or start carrying weight.\n\n"
+    "<b>×2.25 + 80 spins + cashback</b> — active the moment your first "
+    "deposit lands. After that, I'll only talk football."
+)
+
+CASCADE_VIP_PS = (
+    "\n\n<i>P.S. Not into deposits? Fair. The sharpest reads in the league "
+    "live in the VIP channel — /vip</i>"
+)
+
+VIP_INVOICE_DESC = (
+    "Private channel: top-ranked players' picks before kickoff, "
+    "league insights, priority support. 30 days."
+)
+
+VIP_ALREADY = "You're VIP already 👑 Channel: {link}"
+
+VIP_WELCOME = (
+    "👑 <b>Welcome to VIP.</b>\n\nYour channel: {link}\n\n"
+    "Picks from the league's top brains land there before every kickoff. "
+    "See you inside."
+)
+
+BTN_CASH_READ = "💸 Reads like this pay — claim ×2.25"
+BTN_INVITE_SHARE = "📨 Share your link"
+
+INVITE = (
+    "Bring your crew — beat them publicly 😏\n\n"
+    "Your personal link:\n{link}\n\n"
+    "Every friend who joins and makes their first pick = "
+    "<b>+1 point in your weekly league score</b> (up to 3/week). "
+    "They compete, you climb."
+)
+
+INVITE_SHARE_TEXT = (
+    "I'm calling World Cup results in this prediction league — "
+    "Top 10 split 500 USDT every week. Think you read football "
+    "better than me? Prove it:"
+)
+
+REF_JOINED = (
+    "🤝 <b>{name}</b> joined through your link and locked their first pick "
+    "— {points}.\n\nYour rank: /mystats · more friends: /invite"
+)
+
+PROXIMITY = (
+    "📊 League check: you're <b>#{rank}</b> — "
+    "<b>{gap} correct {calls}</b> from the weekly money.\n\n"
+    "Top 10 split the 500 USDT pool when the week closes. "
+    "Next matches: /schedule — every call counts now."
+)
+
 WEBAPP_NUDGE = (
     "{name}, you're playing on hard mode 😅\n\n"
     "Your picks work in chat, but the <b>Live Hub</b> is where the league "
