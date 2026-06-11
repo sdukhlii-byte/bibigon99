@@ -130,6 +130,11 @@ async def upsert_match_ext(ext_id: str, t1: str, t2: str, kickoff: int) -> int:
         if row:
             await db.execute("UPDATE matches SET kickoff=? WHERE id=?",
                              (kickoff, row[0]))
+            # postponed match got a new future date: re-open it for play
+            await db.execute(
+                "UPDATE matches SET result=NULL, score=NULL, announced=0 "
+                "WHERE id=? AND result='V' AND kickoff > ?",
+                (row[0], int(time.time())))
             await db.commit()
             return row[0]
         cur = await db.execute(
@@ -142,12 +147,14 @@ async def upsert_match_ext(ext_id: str, t1: str, t2: str, kickoff: int) -> int:
 async def user_rank(uid: int):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT week_correct FROM users WHERE tg_id=?", (uid,))
+            "SELECT week_correct + COALESCE(ref_week_points,0) "
+            "FROM users WHERE tg_id=?", (uid,))
         row = await cur.fetchone()
         if not row:
             return None
         cur = await db.execute(
-            "SELECT COUNT(*)+1 FROM users WHERE week_total>0 AND week_correct>?",
+            "SELECT COUNT(*)+1 FROM users WHERE week_total>0 "
+            "AND week_correct + COALESCE(ref_week_points,0) > ?",
             (row[0],))
         (rank,) = await cur.fetchone()
         return rank
@@ -221,9 +228,12 @@ async def save_prediction(uid: int, mid: int, pick: str) -> bool:
         cur = await db.execute(
             "SELECT COUNT(*) FROM predictions WHERE user_id=?", (uid,))
         (count,) = await cur.fetchone()
+        # NOT "INSERT OR REPLACE": REPLACE = delete+insert, which silently
+        # resets `alerted` (re-arms goal pings) and wipes `correct`.
         await db.execute(
-            "INSERT OR REPLACE INTO predictions (user_id,match_id,pick) "
-            "VALUES (?,?,?)", (uid, mid, pick))
+            "INSERT INTO predictions (user_id,match_id,pick) VALUES (?,?,?) "
+            "ON CONFLICT(user_id,match_id) DO UPDATE SET "
+            "pick=excluded.pick, correct=NULL", (uid, mid, pick))
         await db.execute(
             "UPDATE users SET last_pick_at=?, rehooked=0 WHERE tg_id=?",
             (int(time.time()), uid))
@@ -270,12 +280,28 @@ async def any_live() -> bool:
         return await cur.fetchone() is not None
 
 
+async def void_match(mid: int):
+    """Cancelled / abandoned fixture: close it without scoring anyone.
+    result='V' takes it out of the live loop; predictions stay unscored."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE matches SET result='V', is_live=0 WHERE id=? "
+            "AND result IS NULL", (mid,))
+        await db.commit()
+
+
 async def settle_match(mid: int, result: str, score: str):
-    """Mark result, score predictions, update user stats. Returns affected rows."""
+    """Mark result, score predictions, update user stats. Returns affected rows.
+    Idempotent: a match that already has a result is never re-scored —
+    double-settling would double-count correct/total/week_* for every picker."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        await db.execute("UPDATE matches SET result=?, score=? WHERE id=?",
-                         (result, score, mid))
+        cur = await db.execute(
+            "UPDATE matches SET result=?, score=? WHERE id=? AND result IS NULL",
+            (result, score, mid))
+        if cur.rowcount == 0:        # already settled (or voided)
+            await db.commit()
+            return []
         cur = await db.execute(
             "SELECT * FROM predictions WHERE match_id=?", (mid,))
         preds = await cur.fetchall()
@@ -308,13 +334,16 @@ async def converted_count() -> int:
 
 
 async def leaderboard(limit: int = 20):
-    """Weekly league — matches the 'Top 10 every week' prize promise."""
+    """Weekly league — matches the 'Top 10 every week' prize promise.
+    League score = correct calls + referral points (capped in credit_referral);
+    ties break to fewer attempts, then most recent activity."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
             "SELECT name, team, week_correct AS correct, week_total AS total, "
-            "streak FROM users WHERE week_total > 0 OR last_pick_at > 0 "
-            "ORDER BY week_correct DESC, week_total ASC, last_pick_at DESC "
+            "streak, week_correct + COALESCE(ref_week_points,0) AS points "
+            "FROM users WHERE week_total > 0 OR last_pick_at > 0 "
+            "ORDER BY points DESC, week_total ASC, last_pick_at DESC "
             "LIMIT ?", (limit,))
         return await cur.fetchall()
 
@@ -323,9 +352,10 @@ async def weekly_top(limit: int = 10):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
-            "SELECT tg_id, name, week_correct, week_total FROM users "
-            "WHERE week_total > 0 ORDER BY week_correct DESC, week_total ASC "
-            "LIMIT ?", (limit,))
+            "SELECT tg_id, name, week_correct, week_total, "
+            "week_correct + COALESCE(ref_week_points,0) AS points "
+            "FROM users WHERE week_total > 0 "
+            "ORDER BY points DESC, week_total ASC LIMIT ?", (limit,))
         return await cur.fetchall()
 
 
@@ -359,9 +389,12 @@ async def credit_referral(invitee: int):
             return None, False
         give = r["ref_week_points"] < 3
         if give:
+            # league points live in ref_week_points only — never in
+            # week_correct, or accuracy breaks (correct > total) and the
+            # week_total ASC tie-break starts favouring inviters.
             await db.execute(
                 "UPDATE users SET referrals=referrals+1, "
-                "week_correct=week_correct+1, ref_week_points=ref_week_points+1 "
+                "ref_week_points=ref_week_points+1 "
                 "WHERE tg_id=?", (rid,))
         else:
             await db.execute(

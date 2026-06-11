@@ -303,7 +303,7 @@ VIP_EXPIRED = (
 )
 
 WEEKLY_WINNER_DM = (
-    "🏆 <b>You finished #{rank} this week</b> with {n} correct calls — "
+    "🏆 <b>You finished #{rank} this week</b> with {n} league points — "
     "you're in the money.\n\n"
     "The prize split lands within 24h. If we need payout details, "
     "we'll message you right here. Congrats — now defend it 😏"

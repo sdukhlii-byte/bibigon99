@@ -282,8 +282,16 @@ async def team_chosen(cb: CallbackQuery):
 @r.callback_query(F.data.startswith("pick:"))
 async def pick(cb: CallbackQuery):
     _, mid, choice = cb.data.split(":")
-    first = await db.save_prediction(cb.from_user.id, int(mid), choice)
+    # Inline keyboards under old announce messages live in chat forever.
+    # Without this guard anyone can tap the leading team in the 85th minute
+    # and get it scored at settle — same rule as the mini-app API.
     m = await db.get_match(int(mid))
+    if not m or m["result"] or m["kickoff"] <= int(time.time()) \
+            or choice not in ("1", "X", "2"):
+        await cb.answer("⏱ Predictions closed — this match already kicked off",
+                        show_alert=True)
+        return
+    first = await db.save_prediction(cb.from_user.id, int(mid), choice)
     label = {"1": m["t1"], "X": "Draw", "2": m["t2"]}[choice]
     await cb.answer(f"Locked: {label} 🎯")
 
@@ -386,8 +394,13 @@ async def addmatch(msg: Message):
 
 
 async def do_settle(mid: int, result: str, score: str) -> int:
-    """Score predictions, push results, fire bridge triggers. Returns count."""
+    """Score predictions, push results, fire bridge triggers. Returns count.
+    Returns -1 if the match was already settled (nothing re-scored)."""
     m = await db.get_match(mid)
+    if not m:
+        return -1
+    if m["result"]:                  # idempotent: never double-count stats
+        return -1
     rows = await db.settle_match(mid, result, score)
     for uid, ok in rows:
         u = await db.get_user(uid)
@@ -419,6 +432,10 @@ async def settle(msg: Message):
     try:
         _, mid, result, score = msg.text.split()
         n = await do_settle(int(mid), result, score)
+        if n < 0:
+            await msg.answer(f"⚠️ Match #{mid} is already settled — "
+                             f"re-settling would double-count stats. Skipped.")
+            return
         await msg.answer(f"Settled #{mid}: {n} predictions scored. "
                          f"Converted so far: {await db.converted_count()}")
     except Exception as e:
@@ -656,6 +673,19 @@ async def sync_fixtures() -> dict:
             if odds:                                # real ESPN line, when given
                 await db.set_match_odds(mid, str(odds)[:32])
             state = ev.get("status", {}).get("type", {}).get("state", "pre")
+            tname = ev.get("status", {}).get("type", {}).get("name", "")
+            completed = bool(ev.get("status", {}).get("type", {})
+                             .get("completed"))
+            # cancelled / abandoned / forfeited: close without scoring,
+            # otherwise the fixture shows "live" in the hub forever
+            if state == "post" and not completed and any(
+                    k in tname for k in ("CANCEL", "ABANDON", "FORFEIT",
+                                         "POSTPONED")):
+                local = await db.get_match(mid)
+                if local and not local["result"]:
+                    await db.void_match(mid)
+                    log.info("voided match %s (%s)", mid, tname)
+                continue
             if state == "in":      # in-play: stream the live score to the hub
                 hs, as_ = int(home.get("score", 0)), int(away.get("score", 0))
                 new_score = f"{hs}:{as_}"
@@ -745,30 +775,43 @@ async def scheduler():
                     - g.tm_min * 60 - g.tm_sec
                 await db.meta_set("week_start", str(week_start))
             elif now - week_start >= 7 * DAY:
-                top = await db.weekly_top(10)
-                if top:
-                    podium = "\n".join(
-                        f"{i+1}. {r['name']} — {r['week_correct']}/{r['week_total']}"
-                        for i, r in enumerate(top))
-                    text = T.WEEKLY_PODIUM.format(podium=podium)
-                    for u in await db.all_users("team IS NOT NULL AND blocked=0"):
-                        await safe_send_photo(u["tg_id"], "podium.png", text)
-                        await asyncio.sleep(0.05)
-                    # the promise in the podium text, kept: personal DMs
-                    for i, r in enumerate(top, start=1):
-                        await safe_send(r["tg_id"], T.WEEKLY_WINNER_DM.format(
-                            rank=i, n=r["week_correct"]))
-                        await asyncio.sleep(0.05)
-                    # payout sheet to admins — pay Monday, post proofs
-                    sheet = "\n".join(
-                        f"{i}. {r['name']} (id {r['tg_id']}) — "
-                        f"{r['week_correct']}/{r['week_total']}"
-                        for i, r in enumerate(top, start=1))
-                    for aid in ADMIN_IDS:
-                        await safe_send(aid, T.ADMIN_PAYOUT_SHEET.format(
-                            sheet=sheet))
-                await db.weekly_reset()
-                await db.meta_set("week_start", str(week_start + 7 * DAY))
+                # Sunday 23:00 kickoffs finish AFTER Monday 00:00 — settle
+                # them into the closing week before paying out, otherwise
+                # their points leak into next week. Hard cap: 4h grace.
+                pending = await db.matches_where(
+                    "result IS NULL AND kickoff >= ? AND kickoff < ?",
+                    (week_start, week_start + 7 * DAY))
+                if pending and now - week_start < 7 * DAY + 4 * HOUR:
+                    await sync_fixtures()
+                    await db.meta_set("last_sync", str(now))
+                else:
+                    top = await db.weekly_top(10)
+                    if top:
+                        podium = "\n".join(
+                            f"{i+1}. {r['name']} — {r['points']} pts "
+                            f"({r['week_correct']}/{r['week_total']})"
+                            for i, r in enumerate(top))
+                        text = T.WEEKLY_PODIUM.format(podium=podium)
+                        for u in await db.all_users(
+                                "team IS NOT NULL AND blocked=0"):
+                            await safe_send_photo(u["tg_id"], "podium.png", text)
+                            await asyncio.sleep(0.05)
+                        # the promise in the podium text, kept: personal DMs
+                        for i, r in enumerate(top, start=1):
+                            await safe_send(r["tg_id"], T.WEEKLY_WINNER_DM.format(
+                                rank=i, n=r["points"]))
+                            await asyncio.sleep(0.05)
+                        # payout sheet to admins — pay Monday, post proofs
+                        sheet = "\n".join(
+                            f"{i}. {r['name']} (id {r['tg_id']}) — "
+                            f"{r['points']} pts "
+                            f"({r['week_correct']}/{r['week_total']})"
+                            for i, r in enumerate(top, start=1))
+                        for aid in ADMIN_IDS:
+                            await safe_send(aid, T.ADMIN_PAYOUT_SHEET.format(
+                                sheet=sheet))
+                    await db.weekly_reset()
+                    await db.meta_set("week_start", str(week_start + 7 * DAY))
 
             # 0d) VIP expiry: honest 30 days, renewal prompt on the way out
             for u in await db.all_users(
@@ -795,9 +838,9 @@ async def scheduler():
                     await db.meta_get("proximity_week", "") != str(week_start):
                 top = await db.weekly_top(20)
                 if len(top) > 10:
-                    threshold = top[9]["week_correct"]
+                    threshold = top[9]["points"]
                     for i, r in enumerate(top[10:], start=11):
-                        gap = max(1, threshold - r["week_correct"] + 1)
+                        gap = max(1, threshold - r["points"] + 1)
                         await safe_send(r["tg_id"], T.PROXIMITY.format(
                             rank=i, gap=gap,
                             calls="call" if gap == 1 else "calls"))
@@ -1010,8 +1053,12 @@ async def api_matches(request):
         "id": m["id"], "t1": m["t1"], "t2": m["t2"],
         "kickoff": m["kickoff"], "result": m["result"], "score": m["score"],
         "odds": m["odds"],
+        # "live" needs a positive signal (ESPN in-play flag) or a recent
+        # kickoff; a fixture that kicked off >4h ago and never settled is
+        # stuck (API gap / abandonment) — don't show it as live forever
         "status": "settled" if m["result"] else
-                  ("live" if (m["is_live"] or m["kickoff"] <= now)
+                  ("live" if (m["is_live"] or
+                              now - 4 * HOUR < m["kickoff"] <= now)
                    else "upcoming"),
         "my_pick": picks.get(m["id"]),
     } for m in rows])
@@ -1053,6 +1100,7 @@ async def api_leaderboard(request):
     return web.json_response([{
         "rank": i + 1, "name": r["name"], "team": r["team"],
         "correct": r["correct"], "total": r["total"], "streak": r["streak"],
+        "points": r["points"],
     } for i, r in enumerate(rows)])
 
 
