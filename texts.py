@@ -14,6 +14,13 @@ START = (
     "<b>Who takes the World Cup this year?</b> 🏆"
 )
 
+START_IG = (
+    "Instagram crew — you found it 👊 This week's <b>500 USDT prize pool</b> "
+    "is live, and you're in before most people even know it exists.\n\n"
+    "One question and you're in the game:\n"
+    "<b>Who takes the World Cup this year?</b> 🏆"
+)
+
 TEAM_SAVED = (
     "Locked in ✍️ <b>{team}</b> to go all the way.\n\n"
     "Here's what you just unlocked:\n"
