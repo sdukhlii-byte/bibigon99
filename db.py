@@ -80,7 +80,8 @@ async def init():
                          ("deposited", "INTEGER DEFAULT 0"),
                          ("registered_at", "INTEGER DEFAULT 0"),
                          ("dep_cascade_step", "INTEGER DEFAULT 0"),
-                         ("vip", "INTEGER DEFAULT 0")]:
+                         ("vip", "INTEGER DEFAULT 0"),
+                         ("vip_until", "INTEGER DEFAULT 0")]:
             try:
                 await db.execute(f"ALTER TABLE users ADD COLUMN {col} {ddl}")
             except Exception:
@@ -387,6 +388,10 @@ async def stats():
             "phones": "SELECT COUNT(*) FROM users WHERE phone IS NOT NULL",
             "bridge_clicks": "SELECT COUNT(*) FROM users WHERE bridge_clicked_at IS NOT NULL",
             "registered": "SELECT COUNT(*) FROM users WHERE registered=1",
+            "deposited": "SELECT COUNT(*) FROM users WHERE deposited=1",
+            "vip_active": "SELECT COUNT(*) FROM users WHERE vip=1",
+            "referred_users":
+                "SELECT COUNT(*) FROM users WHERE referrer_id IS NOT NULL",
         }
         out = {}
         for k, sql in q.items():

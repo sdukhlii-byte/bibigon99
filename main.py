@@ -438,14 +438,29 @@ async def stats(msg: Message):
     await msg.answer("\n".join(lines))
 
 
+@r.message(Command("backup"))
+async def backup_cmd(msg: Message):
+    if not admin(msg):
+        return
+    try:
+        await msg.answer_document(
+            FSInputFile(db.DB_PATH,
+                        filename=f"funnel_{time.strftime('%Y%m%d_%H%M')}.db"),
+            caption="🗄 DB backup — store it off-Railway.")
+    except Exception as e:
+        await msg.answer(f"Backup failed: {e}")
+
+
 @r.message(Command("vip"))
 async def vip_cmd(msg: Message):
     if not VIP_CHANNEL_INVITE:
         await msg.answer("VIP launches soon — stay tuned 👀")
         return
     u = await db.get_user(msg.from_user.id)
-    if u and u["vip"]:
-        await msg.answer(T.VIP_ALREADY.format(link=VIP_CHANNEL_INVITE),
+    if u and u["vip"] and u["vip_until"] > int(time.time()):
+        days = (u["vip_until"] - int(time.time())) // DAY + 1
+        await msg.answer(T.VIP_ALREADY.format(link=VIP_CHANNEL_INVITE,
+                                              days=days),
                          disable_web_page_preview=True)
         return
     from aiogram.types import LabeledPrice
@@ -464,10 +479,13 @@ async def pre_checkout(q):
 
 @r.message(F.successful_payment)
 async def vip_paid(msg: Message):
-    await db.set_user(msg.from_user.id, vip=1)
+    now = int(time.time())
+    u = await db.get_user(msg.from_user.id)
+    base = max(now, (u["vip_until"] or 0) if u else 0)   # renewals stack
+    await db.set_user(msg.from_user.id, vip=1, vip_until=base + 30 * DAY)
     await msg.answer(T.VIP_WELCOME.format(link=VIP_CHANNEL_INVITE),
                      disable_web_page_preview=True)
-    log.info("VIP purchase uid=%s", msg.from_user.id)
+    log.info("VIP purchase uid=%s until=%s", msg.from_user.id, base + 30 * DAY)
 
 
 @r.message(Command("invite"))
@@ -736,8 +754,28 @@ async def scheduler():
                     for u in await db.all_users("team IS NOT NULL AND blocked=0"):
                         await safe_send_photo(u["tg_id"], "podium.png", text)
                         await asyncio.sleep(0.05)
+                    # the promise in the podium text, kept: personal DMs
+                    for i, r in enumerate(top, start=1):
+                        await safe_send(r["tg_id"], T.WEEKLY_WINNER_DM.format(
+                            rank=i, n=r["week_correct"]))
+                        await asyncio.sleep(0.05)
+                    # payout sheet to admins — pay Monday, post proofs
+                    sheet = "\n".join(
+                        f"{i}. {r['name']} (id {r['tg_id']}) — "
+                        f"{r['week_correct']}/{r['week_total']}"
+                        for i, r in enumerate(top, start=1))
+                    for aid in ADMIN_IDS:
+                        await safe_send(aid, T.ADMIN_PAYOUT_SHEET.format(
+                            sheet=sheet))
                 await db.weekly_reset()
                 await db.meta_set("week_start", str(week_start + 7 * DAY))
+
+            # 0d) VIP expiry: honest 30 days, renewal prompt on the way out
+            for u in await db.all_users(
+                    "vip=1 AND vip_until > 0 AND vip_until < ? AND blocked=0",
+                    (now,)):
+                await db.set_user(u["tg_id"], vip=0)
+                await safe_send(u["tg_id"], T.VIP_EXPIRED)
 
             # 0c) FOMO receipt: day 6 of the week, unregistered players with
             # 2+ correct calls get THEIR OWN numbers back as missed upside

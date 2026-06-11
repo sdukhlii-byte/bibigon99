@@ -294,7 +294,24 @@ VIP_INVOICE_DESC = (
     "league insights, priority support. 30 days."
 )
 
-VIP_ALREADY = "You're VIP already 👑 Channel: {link}"
+VIP_ALREADY = "You're VIP already 👑 ({days} days left) · Channel: {link}"
+
+VIP_EXPIRED = (
+    "👑 Your VIP Pass just expired.\n\n"
+    "The picks keep landing in the channel — you just stopped seeing them. "
+    "Renew in two taps: /vip"
+)
+
+WEEKLY_WINNER_DM = (
+    "🏆 <b>You finished #{rank} this week</b> with {n} correct calls — "
+    "you're in the money.\n\n"
+    "The prize split lands within 24h. If we need payout details, "
+    "we'll message you right here. Congrats — now defend it 😏"
+)
+
+ADMIN_PAYOUT_SHEET = (
+    "💸 <b>Weekly payout sheet</b> — pay today, post proofs:\n\n{sheet}"
+)
 
 VIP_WELCOME = (
     "👑 <b>Welcome to VIP.</b>\n\nYour channel: {link}\n\n"
