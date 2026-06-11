@@ -94,6 +94,15 @@ async def init():
                 "ALTER TABLE matches ADD COLUMN is_live INTEGER DEFAULT 0")
         except Exception:
             pass
+        try:
+            await db.execute("ALTER TABLE matches ADD COLUMN odds TEXT")
+        except Exception:
+            pass
+        try:
+            await db.execute(
+                "ALTER TABLE predictions ADD COLUMN alerted INTEGER DEFAULT 0")
+        except Exception:
+            pass
         await db.commit()
 
 
@@ -226,6 +235,30 @@ async def set_match_live(mid: int, score: str, live: int = 1):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("UPDATE matches SET score=?, is_live=? WHERE id=?",
                          (score, live, mid))
+        await db.commit()
+
+
+async def set_match_odds(mid: int, odds: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE matches SET odds=? WHERE id=?", (odds, mid))
+        await db.commit()
+
+
+async def picks_for_match(mid: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT p.user_id, p.pick, p.alerted FROM predictions p "
+            "JOIN users u ON u.tg_id = p.user_id "
+            "WHERE p.match_id=? AND u.blocked=0", (mid,))
+        return await cur.fetchall()
+
+
+async def mark_alerted(uid: int, mid: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE predictions SET alerted=1 WHERE user_id=? AND match_id=?",
+            (uid, mid))
         await db.commit()
 
 

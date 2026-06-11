@@ -247,6 +247,28 @@ DEP_CONGRATS = (
     "different stakes. Good luck out there 🎯"
 )
 
+GOAL_ALERT = (
+    "⚡ <b>GOAL</b> — {t1} {score} {t2}\n\n"
+    "Your call is <b>{status}</b>"
+)
+
+ODDS_LINE = "\n\n📈 Line: <b>{odds}</b>"
+
+STREAK_LINE = "\n🔥 Your <b>{streak}-streak</b> is on the line with this one."
+
+WC_COUNTDOWN = (
+    "\n\n⏳ <b>{days} days</b> of World Cup left — the bonus rides the "
+    "tournament, and the tournament doesn't wait."
+)
+
+FOMO_RECEIPT = (
+    "{name}, your week in one line:\n\n"
+    "<b>{n} results called correctly.</b> For free.\n\n"
+    "Same reads with the ×2.25 stack behind them = working capital, "
+    "not trivia points. The league resets tomorrow — next week, "
+    "same brain, real weight?"
+)
+
 DEP_CASCADE_20H = (
     "{name}, your bonus is sitting there fully loaded — and unused 🔋\n\n"
     "The math, one more time: <b>20 USDT in → 45 USDT to play with</b> "

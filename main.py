@@ -49,6 +49,13 @@ SYNC_INTERVAL_MIN = int(os.getenv("SYNC_INTERVAL_MIN", 30))    # idle ESPN poll 
 LIVE_SYNC_MIN = int(os.getenv("LIVE_SYNC_MIN", 3))             # cadence while a match is in play
 VIP_PRICE_STARS = int(os.getenv("VIP_PRICE_STARS", 250))       # Telegram Stars / month
 VIP_CHANNEL_INVITE = os.getenv("VIP_CHANNEL_INVITE", "")       # private VIP channel invite link
+WC_END = os.getenv("WC_END", "2026-07-19")                     # real deadline = honest FOMO
+
+
+def wc_days_left() -> int:
+    import calendar
+    end = calendar.timegm(time.strptime(WC_END, "%Y-%m-%d"))
+    return max(0, (end - int(time.time())) // DAY)
 NEWS_RSS_URL = os.getenv("NEWS_RSS_URL",
                          "https://feeds.bbci.co.uk/sport/football/rss.xml")
 DIGEST_HOUR_UTC = int(os.getenv("DIGEST_HOUR_UTC", 9))
@@ -627,10 +634,33 @@ async def sync_fixtures() -> dict:
                 ev["date"].replace("Z", "+00:00")).timestamp())
             mid = await db.upsert_match_ext(str(ev["id"]), t1, t2, kickoff)
             upserted += 1
+            odds = (comp.get("odds") or [{}])[0].get("details")
+            if odds:                                # real ESPN line, when given
+                await db.set_match_odds(mid, str(odds)[:32])
             state = ev.get("status", {}).get("type", {}).get("state", "pre")
             if state == "in":      # in-play: stream the live score to the hub
                 hs, as_ = int(home.get("score", 0)), int(away.get("score", 0))
-                await db.set_match_live(mid, f"{hs}:{as_}", live=1)
+                new_score = f"{hs}:{as_}"
+                prev = (await db.get_match(mid))["score"] or "0:0"
+                await db.set_match_live(mid, new_score, live=1)
+                if new_score != prev:   # goal: dopamine ping to pickers, once
+                    local = await db.get_match(mid)
+                    for p in await db.picks_for_match(mid):
+                        if p["alerted"]:
+                            continue
+                        if p["pick"] == "1":
+                            st = "ahead ✅" if hs > as_ else \
+                                 ("level ⚖️" if hs == as_ else "behind 😬")
+                        elif p["pick"] == "2":
+                            st = "ahead ✅" if as_ > hs else \
+                                 ("level ⚖️" if hs == as_ else "behind 😬")
+                        else:
+                            st = "ahead ✅" if hs == as_ else "behind 😬"
+                        await safe_send(p["user_id"], T.GOAL_ALERT.format(
+                            t1=local["t1"], t2=local["t2"], score=new_score,
+                            status=st), reply_markup=kb_webapp(T.BTN_HUB_TRACK))
+                        await db.mark_alerted(p["user_id"], mid)
+                        await asyncio.sleep(0.05)
             if ev.get("status", {}).get("type", {}).get("completed"):
                 local = await db.get_match(mid)
                 if local and not local["result"]:
@@ -709,6 +739,18 @@ async def scheduler():
                 await db.weekly_reset()
                 await db.meta_set("week_start", str(week_start + 7 * DAY))
 
+            # 0c) FOMO receipt: day 6 of the week, unregistered players with
+            # 2+ correct calls get THEIR OWN numbers back as missed upside
+            if now - week_start >= 6 * DAY and \
+                    await db.meta_get("fomo_week", "") != str(week_start):
+                for u in await db.all_users(
+                        "registered=0 AND blocked=0 AND week_correct >= 2"):
+                    await safe_send(u["tg_id"], T.FOMO_RECEIPT.format(
+                        name=u["name"], n=u["week_correct"]),
+                        reply_markup=kb_bridge(u["tg_id"], T.BTN_CASH_READ))
+                    await asyncio.sleep(0.05)
+                await db.meta_set("fomo_week", str(week_start))
+
             # 0b) prize proximity: midweek, tell ranks 11-20 how close the
             # money is — nothing retains like an almost-won prize
             if now - week_start >= 4 * DAY and \
@@ -765,6 +807,10 @@ async def scheduler():
                             team=u["team"], t1=m["t1"], t2=m["t2"], hours=hours)
                     else:
                         txt = T.NEW_MATCH.format(t1=m["t1"], t2=m["t2"], hours=hours)
+                    if m["odds"]:
+                        txt += T.ODDS_LINE.format(odds=m["odds"])
+                    if u["streak"] >= 2:
+                        txt += T.STREAK_LINE.format(streak=u["streak"])
                     await safe_send_photo(
                         u["tg_id"], f"new_match_{m['id'] % 2 + 1}.png",
                         txt, reply_markup=kb_pick(m))
@@ -818,11 +864,13 @@ async def scheduler():
                         "registered=1 AND deposited=0 AND blocked=0 "
                         "AND dep_cascade_step < ? AND registered_at > 0 "
                         "AND registered_at < ?", (step, now - delay)):
+                    body = getattr(T, key).format(name=u["name"],
+                                                  team=u["team"] or "Your team")
+                    if step == 1 and wc_days_left() > 0:
+                        body += T.WC_COUNTDOWN.format(days=wc_days_left())
                     await safe_send_photo(
                         u["tg_id"], "dep_win.png" if step == 2 else None,
-                        getattr(T, key).format(name=u["name"],
-                                               team=u["team"] or "Your team"),
-                        reply_markup=kb_bridge(u["tg_id"], T.BRIDGE_BUTTON))
+                        body, reply_markup=kb_bridge(u["tg_id"], T.BRIDGE_BUTTON))
                     await db.set_user(u["tg_id"], dep_cascade_step=step)
                     await asyncio.sleep(0.05)
 
