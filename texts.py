@@ -100,7 +100,30 @@ MYSTATS = (
     "League rank: <b>#{rank}</b>\n\n"
     "Top 10 split the weekly 500 USDT pool. Keep climbing."
 )
-MYSTATS_EMPTY = "No picks yet — your card is empty. Fix that: /schedule"
+MYSTATS_EMPTY = "No picks yet — your card is empty. Fix that: tap 🎯 Make a Pick"
+
+# ---------- persistent main menu ----------
+
+BTN_MENU_PICK = "🎯 Make a Pick"
+BTN_MENU_STATS = "🏆 My Stats"
+BTN_MENU_NEWS = "⚽ News"
+BTN_MENU_HUB = "🚀 Live Hub"
+
+# ---------- proactive verification (onboarding + nudge) ----------
+
+VERIFY_PUSH = (
+    "You're officially in the league 🏆\n\n"
+    "One thing separates players from spectators here: the weekly "
+    "<b>500 USDT prize pool</b> only pays out to <b>verified</b> players.\n\n"
+    "One tap below — and every point you score counts toward real money:"
+)
+
+VERIFY_NUDGE = (
+    "{name}, quick one — you're in the league, but you're "
+    "<b>not prize-eligible yet</b> 👀\n\n"
+    "If your week ends in the top 10, the 500 USDT pool splits "
+    "<i>without you</i>. One tap fixes it:"
+)
 
 EMAIL_SAVED = (
     "Done ✅ You're prize-eligible.\n\n"
