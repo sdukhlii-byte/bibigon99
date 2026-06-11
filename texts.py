@@ -247,6 +247,14 @@ DEP_CONGRATS = (
     "different stakes. Good luck out there 🎯"
 )
 
+WEBAPP_NUDGE = (
+    "{name}, you're playing on hard mode 😅\n\n"
+    "Your picks work in chat, but the <b>Live Hub</b> is where the league "
+    "actually lives: live scores as they happen, your full card, the "
+    "leaderboard you're climbing — all in one screen.\n\n"
+    "Took 30 seconds to set up. Takes 1 tap to open 👇"
+)
+
 # ---------- weekly league reset ----------
 
 WEEKLY_PODIUM = (

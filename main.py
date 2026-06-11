@@ -91,8 +91,9 @@ def kb_bridge(uid: int, label: str) -> InlineKeyboardMarkup:
     base = TRACKER_URL or PRELANDING_URL
     sep = "&" if "?" in base else "?"
     param = "sub_id_2" if TRACKER_URL else "uid"
+    tag = "&sub_id_3=bot" if TRACKER_URL else ""
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text=label, url=f"{base}{sep}{param}={uid}")
+        InlineKeyboardButton(text=label, url=f"{base}{sep}{param}={uid}{tag}")
     ]])
 
 
@@ -715,6 +716,16 @@ async def scheduler():
                                       reply_markup=kb)
                 await db.set_user(u["tg_id"], rehooked=1)
 
+            # 5a) one-time Live Hub nudge: picks in chat, never opened the app
+            for u in await db.all_users(
+                    "last_pick_at > 0 AND last_webapp_at = 0 "
+                    "AND webapp_nudged = 0 AND blocked = 0 "
+                    "AND last_pick_at < ?", (now - 6 * HOUR,)):
+                await safe_send(u["tg_id"],
+                                T.WEBAPP_NUDGE.format(name=u["name"]),
+                                reply_markup=kb_webapp())
+                await db.set_user(u["tg_id"], webapp_nudged=1)
+
             # 5) 4h reminder for users without a team
             for u in await db.all_users(
                     "team IS NULL AND reminded_team=0 AND blocked=0 AND created_at < ?",
@@ -783,6 +794,7 @@ async def api_me(request):
     u = await db.get_user(uid)
     if not u:
         return web.json_response({"error": "start the bot first"}, status=404)
+    await db.set_user(uid, last_webapp_at=int(time.time()))   # hub visit beacon
     return web.json_response({
         "name": u["name"], "team": u["team"],
         "correct": u["correct"], "total": u["total"], "streak": u["streak"],

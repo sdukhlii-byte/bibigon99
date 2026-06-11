@@ -33,7 +33,9 @@ CREATE TABLE IF NOT EXISTS users (
     week_correct INTEGER DEFAULT 0,          -- weekly league (prize pool window)
     week_total   INTEGER DEFAULT 0,
     capi_lead_sent INTEGER DEFAULT 0,        -- Meta CAPI Lead dedup
-    last_announce_push INTEGER DEFAULT 0     -- announce frequency cap
+    last_announce_push INTEGER DEFAULT 0,    -- announce frequency cap
+    last_webapp_at INTEGER DEFAULT 0,        -- last mini-app open (api/me auth)
+    webapp_nudged INTEGER DEFAULT 0          -- one-time Live Hub nudge sent
 );
 CREATE TABLE IF NOT EXISTS matches (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -68,7 +70,9 @@ async def init():
                          ("week_correct", "INTEGER DEFAULT 0"),
                          ("week_total", "INTEGER DEFAULT 0"),
                          ("capi_lead_sent", "INTEGER DEFAULT 0"),
-                         ("last_announce_push", "INTEGER DEFAULT 0")]:
+                         ("last_announce_push", "INTEGER DEFAULT 0"),
+                         ("last_webapp_at", "INTEGER DEFAULT 0"),
+                         ("webapp_nudged", "INTEGER DEFAULT 0")]:
             try:
                 await db.execute(f"ALTER TABLE users ADD COLUMN {col} {ddl}")
             except Exception:
