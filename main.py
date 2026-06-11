@@ -971,6 +971,7 @@ async def api_matches(request):
     return web.json_response([{
         "id": m["id"], "t1": m["t1"], "t2": m["t2"],
         "kickoff": m["kickoff"], "result": m["result"], "score": m["score"],
+        "odds": m["odds"],
         "status": "settled" if m["result"] else
                   ("live" if (m["is_live"] or m["kickoff"] <= now)
                    else "upcoming"),
