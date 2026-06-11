@@ -19,7 +19,7 @@ import time
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import (CallbackQuery, InlineKeyboardButton,
                            InlineKeyboardMarkup, KeyboardButton, Message,
                            ReplyKeyboardMarkup, ReplyKeyboardRemove)
@@ -49,6 +49,34 @@ DIGEST_HOUR_UTC = int(os.getenv("DIGEST_HOUR_UTC", 9))
 
 EMAIL_RE = re.compile(r"^[\w.+-]+@[\w-]+\.[\w.]+$")
 HOUR, DAY = 3600, 86400
+
+META_PIXEL_ID = os.getenv("META_PIXEL_ID", "")
+META_CAPI_TOKEN = os.getenv("META_CAPI_TOKEN", "")
+
+
+async def meta_event(event_name: str, tg_id: int):
+    """Server-side conversion to Meta CAPI so the algo has food to optimize on.
+    Matched via hashed external_id; enrich with fbp/fbclid on the prelanding
+    pixel for higher match quality."""
+    if not (META_PIXEL_ID and META_CAPI_TOKEN):
+        return
+    import hashlib as _h
+    import aiohttp as _aio
+    payload = {"data": [{
+        "event_name": event_name,
+        "event_time": int(time.time()),
+        "action_source": "website",
+        "user_data": {"external_id":
+                      _h.sha256(str(tg_id).encode()).hexdigest()},
+    }]}
+    try:
+        async with _aio.ClientSession() as s:
+            await s.post(
+                f"https://graph.facebook.com/v21.0/{META_PIXEL_ID}/events",
+                params={"access_token": META_CAPI_TOKEN},
+                json=payload, timeout=10)
+    except Exception as e:
+        log.warning("meta capi failed: %s", e)
 
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
@@ -131,9 +159,12 @@ async def safe_send(uid: int, text: str, **kw):
 # FLOOR 1 — /start + team segmentation
 # ----------------------------------------------------------------------
 @r.message(CommandStart())
-async def start(msg: Message):
-    await db.upsert_user(msg.from_user.id, msg.from_user.first_name or "mate")
-    await msg.answer(T.START, reply_markup=kb_teams())
+async def start(msg: Message, command: CommandObject):
+    source = (command.args or "").strip()[:64] or None
+    await db.upsert_user(msg.from_user.id, msg.from_user.first_name or "mate",
+                         source=source)
+    text = T.START_IG if source and source.startswith("ig") else T.START
+    await msg.answer(text, reply_markup=kb_teams())
 
 
 @r.callback_query(F.data.startswith("team:"))
@@ -187,6 +218,7 @@ async def got_contact(msg: Message):
         return
     await db.set_user(msg.from_user.id,
                       phone=msg.contact.phone_number, awaiting_email=0)
+    await meta_event("Lead", msg.from_user.id)
     await msg.answer(T.CONTACT_SAVED, reply_markup=kb_main())
 
 
@@ -239,6 +271,7 @@ async def maybe_email(msg: Message):
     if EMAIL_RE.match(msg.text.strip()):
         await db.set_user(msg.from_user.id,
                           email=msg.text.strip().lower(), awaiting_email=0)
+        await meta_event("Lead", msg.from_user.id)
         await msg.answer(T.EMAIL_SAVED, reply_markup=kb_main())
     else:
         await msg.answer(T.EMAIL_INVALID)
@@ -322,7 +355,12 @@ async def stats(msg: Message):
     if not admin(msg):
         return
     s = await db.stats()
-    await msg.answer("\n".join(f"<b>{k}</b>: {v}" for k, v in s.items()))
+    lines = [f"<b>{k}</b>: {v}" for k, v in s.items()]
+    src = await db.source_counts()
+    if src:
+        lines.append("\n<b>By source</b> (users / regs):")
+        lines += [f"  {name}: {n} / {regs or 0}" for name, n, regs in src]
+    await msg.answer("\n".join(lines))
 
 
 @r.message(Command("broadcast"))
@@ -780,6 +818,7 @@ async def postback(request: web.Request):
         return web.Response(status=404, text="unknown uid")
     if event == "reg" and not user["registered"]:
         await db.set_user(uid, registered=1)
+        await meta_event("CompleteRegistration", uid)
         await safe_send(uid, T.REG_CONGRATS.format(team=user["team"] or "Your team"))
         log.info("registration postback uid=%s", uid)
     return web.Response(text="ok")
