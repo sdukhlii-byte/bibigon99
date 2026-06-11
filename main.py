@@ -217,6 +217,19 @@ async def start(msg: Message):
     await msg.answer(greet, reply_markup=kb_teams())
 
 
+async def edit_or_send(cb: CallbackQuery, text: str, kb=None):
+    """The greeting is a photo now: photos take edit_caption, text messages
+    take edit_text. Any edit failure falls back to sending a new message."""
+    try:
+        if cb.message.photo:
+            await cb.message.edit_caption(caption=text, reply_markup=kb)
+        else:
+            await cb.message.edit_text(text, reply_markup=kb)
+    except Exception as e:
+        log.warning("edit failed (%s), sending new message", e)
+        await cb.message.answer(text, reply_markup=kb)
+
+
 @r.callback_query(F.data.startswith("team:"))
 async def team_chosen(cb: CallbackQuery):
     team = cb.data.split(":", 1)[1]
@@ -227,14 +240,14 @@ async def team_chosen(cb: CallbackQuery):
         "result IS NULL AND kickoff > ?", (int(time.time()),))
     if upcoming:
         m = upcoming[0]
-        await cb.message.edit_text(T.TEAM_SAVED.format(team=team))
+        await edit_or_send(cb, T.TEAM_SAVED.format(team=team))
         await cb.message.answer(
             T.NEW_MATCH.format(t1=m["t1"], t2=m["t2"],
                                hours=max(1, (m["kickoff"] - int(time.time())) // HOUR)),
             reply_markup=kb_pick(m))
     else:
-        await cb.message.edit_text(T.TEAM_SAVED_NO_MATCH.format(team=team),
-                                   reply_markup=kb_webapp())
+        await edit_or_send(cb, T.TEAM_SAVED_NO_MATCH.format(team=team),
+                           kb=kb_webapp())
 
 
 # ----------------------------------------------------------------------
