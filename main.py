@@ -46,7 +46,7 @@ ESPN_LEAGUE = os.getenv("ESPN_LEAGUE", "fifa.world")   # ESPN soccer league slug
 SYNC_LOOKAHEAD_DAYS = int(os.getenv("SYNC_LOOKAHEAD_DAYS", 30))
 ANNOUNCE_GAP = int(os.getenv("ANNOUNCE_GAP_HOURS", 6)) * 3600  # min gap between announce pushes per user
 SYNC_INTERVAL_MIN = int(os.getenv("SYNC_INTERVAL_MIN", 30))    # idle ESPN poll cadence
-LIVE_SYNC_MIN = int(os.getenv("LIVE_SYNC_MIN", 3))             # cadence while a match is in play
+LIVE_POLL_SEC = int(os.getenv("LIVE_POLL_SEC", 60))            # cadence while a match is in play
 VIP_PRICE_STARS = int(os.getenv("VIP_PRICE_STARS", 250))       # Telegram Stars / month
 VIP_CHANNEL_INVITE = os.getenv("VIP_CHANNEL_INVITE", "")       # private VIP channel invite link
 WC_END = os.getenv("WC_END", "2026-07-19")                     # real deadline = honest FOMO
@@ -633,10 +633,18 @@ async def mystats_cmd(msg: Message):
         streak=u["streak"], rank=await db.user_rank(msg.from_user.id)))
 
 
+SYNC_LOCK = asyncio.Lock()   # scheduler + live loop must never sync concurrently
+
+
 async def sync_fixtures() -> dict:
     """Pull World Cup fixtures/results from ESPN's free scoreboard API and
     auto-settle finished matches. No API key, no paid seasons.
     Returns a summary dict for logging / the /sync admin command."""
+    async with SYNC_LOCK:
+        return await _sync_fixtures_inner()
+
+
+async def _sync_fixtures_inner() -> dict:
     start = time.strftime("%Y%m%d", time.gmtime(int(time.time()) - 2 * DAY))
     end = time.strftime("%Y%m%d",
                         time.gmtime(int(time.time()) + SYNC_LOOKAHEAD_DAYS * DAY))
@@ -691,11 +699,19 @@ async def sync_fixtures() -> dict:
                 new_score = f"{hs}:{as_}"
                 prev = (await db.get_match(mid))["score"] or "0:0"
                 await db.set_match_live(mid, new_score, live=1)
-                if new_score != prev:   # goal: dopamine ping to pickers, once
+                # ping on EVERY goal — dedupe is the score transition itself
+                # (prev is read before the write, all under SYNC_LOCK).
+                # Only fire when total goals went UP: a VAR-disallowed goal
+                # rolls the score back and must not trigger a "GOAL" push.
+                def _goals(s):
+                    try:
+                        a, b = s.split(":")
+                        return int(a) + int(b)
+                    except Exception:
+                        return 0
+                if new_score != prev and _goals(new_score) > _goals(prev):
                     local = await db.get_match(mid)
                     for p in await db.picks_for_match(mid):
-                        if p["alerted"]:
-                            continue
                         if p["pick"] == "1":
                             st = "ahead ✅" if hs > as_ else \
                                  ("level ⚖️" if hs == as_ else "behind 😬")
@@ -707,7 +723,6 @@ async def sync_fixtures() -> dict:
                         await safe_send(p["user_id"], T.GOAL_ALERT.format(
                             t1=local["t1"], t2=local["t2"], score=new_score,
                             status=st), reply_markup=kb_webapp(T.BTN_HUB_TRACK))
-                        await db.mark_alerted(p["user_id"], mid)
                         await asyncio.sleep(0.05)
             if ev.get("status", {}).get("type", {}).get("completed"):
                 local = await db.get_match(mid)
@@ -740,6 +755,32 @@ async def sync_cmd(msg: Message):
     else:
         await msg.answer(f"✅ Synced {res['fixtures']} fixtures, "
                          f"auto-settled {res['settled']}.")
+
+
+# ----------------------------------------------------------------------
+# LIVE LOOP — own task, own cadence. The main scheduler ticks every 5 min,
+# which is fine for drips and announces but useless for live football:
+# a goal ping that lands 10 minutes after the stadium roars is noise.
+# This loop polls ESPN every LIVE_POLL_SEC while anything is in play
+# (goal alerts + auto-settle ride on sync_fixtures), and just watches
+# for kickoffs the rest of the time.
+# ----------------------------------------------------------------------
+async def live_sync_loop():
+    while True:
+        try:
+            now = int(time.time())
+            in_play = await db.any_live() or await db.matches_where(
+                "result IS NULL AND kickoff <= ? AND kickoff > ?",
+                (now, now - 3 * HOUR))
+            if in_play:
+                await sync_fixtures()
+                await db.meta_set("last_sync", str(now))
+                await asyncio.sleep(LIVE_POLL_SEC)
+            else:
+                await asyncio.sleep(60)      # idle: just watch for kickoff
+        except Exception:
+            log.exception("live sync loop failed")
+            await asyncio.sleep(60)
 
 
 # ----------------------------------------------------------------------
@@ -847,14 +888,11 @@ async def scheduler():
                         await asyncio.sleep(0.05)
                 await db.meta_set("proximity_week", str(week_start))
 
-            # 0a) fixtures auto-sync (also auto-settles + win/loss pushes).
-            # While a match is in play the hub promises LIVE scores — poll
-            # ESPN every LIVE_SYNC_MIN instead of the idle cadence.
-            in_play = await db.any_live() or await db.matches_where(
-                "result IS NULL AND kickoff <= ? AND kickoff > ?",
-                (now, now - 3 * HOUR))
-            interval = (LIVE_SYNC_MIN if in_play else SYNC_INTERVAL_MIN) * 60
-            if now - int(await db.meta_get("last_sync", "0")) >= interval:
+            # 0a) idle fixtures sync (refreshes the schedule, catches results
+            # missed while nothing was live). Live-cadence polling — goal
+            # alerts, instant settle — lives in live_sync_loop now.
+            if now - int(await db.meta_get("last_sync", "0")) \
+                    >= SYNC_INTERVAL_MIN * 60:
                 await sync_fixtures()
                 await db.meta_set("last_sync", str(now))
 
@@ -1174,6 +1212,7 @@ async def main():
         BotCommand(command="verify", description="✅ Verify for prizes"),
     ])
     asyncio.create_task(scheduler())
+    asyncio.create_task(live_sync_loop())
     log.info("bot polling started")
     await dp.start_polling(bot)
 
