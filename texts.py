@@ -266,7 +266,16 @@ WEEKLY_PODIUM = (
 
 # ---------- buttons ----------
 
-BTN_OPEN_APP = "🚀 Open Live Hub"
+BTN_OPEN_APP = "🚀 Open Live Hub"          # generic fallback
+BTN_HUB_TRACK = "📺 Track your pick LIVE"   # right after a pick / verify
+BTN_HUB_SCORES = "⚡ Live scores now"       # returning user
+BTN_HUB_RANK = "📊 See where you rank"      # hub-nudge for chat-only players
+BTN_HUB_SCHEDULE = "📅 See all matches"     # no match open yet
+
+HUB_AFTER_VERIFY = (
+    "Your pick is in play — watch the score move in real time, "
+    "and check who you need to beat for the weekly pool 👇"
+)
 BTN_PICK_1 = "1️⃣ {t1}"
 BTN_PICK_X = "🤝 Draw"
 BTN_PICK_2 = "2️⃣ {t2}"

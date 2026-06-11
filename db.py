@@ -81,6 +81,11 @@ async def init():
             await db.execute("ALTER TABLE matches ADD COLUMN ext_id TEXT")
         except Exception:
             pass
+        try:
+            await db.execute(
+                "ALTER TABLE matches ADD COLUMN is_live INTEGER DEFAULT 0")
+        except Exception:
+            pass
         await db.commit()
 
 
@@ -206,6 +211,21 @@ async def save_prediction(uid: int, mid: int, pick: str) -> bool:
             (int(time.time()), uid))
         await db.commit()
         return count == 0
+
+
+async def set_match_live(mid: int, score: str, live: int = 1):
+    """In-play score from the sync loop; cleared when the match settles."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE matches SET score=?, is_live=? WHERE id=?",
+                         (score, live, mid))
+        await db.commit()
+
+
+async def any_live() -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT 1 FROM matches WHERE is_live=1 AND result IS NULL LIMIT 1")
+        return await cur.fetchone() is not None
 
 
 async def settle_match(mid: int, result: str, score: str):

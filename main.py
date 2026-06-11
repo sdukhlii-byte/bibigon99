@@ -45,7 +45,8 @@ FOOTBALL_API_KEY = os.getenv("FOOTBALL_API_KEY", "")   # legacy, no longer requi
 ESPN_LEAGUE = os.getenv("ESPN_LEAGUE", "fifa.world")   # ESPN soccer league slug
 SYNC_LOOKAHEAD_DAYS = int(os.getenv("SYNC_LOOKAHEAD_DAYS", 30))
 ANNOUNCE_GAP = int(os.getenv("ANNOUNCE_GAP_HOURS", 6)) * 3600  # min gap between announce pushes per user
-SYNC_INTERVAL_MIN = int(os.getenv("SYNC_INTERVAL_MIN", 30))    # ESPN poll cadence; lower it on matchdays
+SYNC_INTERVAL_MIN = int(os.getenv("SYNC_INTERVAL_MIN", 30))    # idle ESPN poll cadence
+LIVE_SYNC_MIN = int(os.getenv("LIVE_SYNC_MIN", 3))             # cadence while a match is in play
 NEWS_RSS_URL = os.getenv("NEWS_RSS_URL",
                          "https://feeds.bbci.co.uk/sport/football/rss.xml")
 DIGEST_HOUR_UTC = int(os.getenv("DIGEST_HOUR_UTC", 9))
@@ -104,9 +105,11 @@ def kb_contact() -> ReplyKeyboardMarkup:
         resize_keyboard=True, one_time_keyboard=True)
 
 
-def kb_webapp() -> InlineKeyboardMarkup:
+def kb_webapp(label: str | None = None) -> InlineKeyboardMarkup:
+    """One button, many jobs: the label sells the OUTCOME of opening the
+    hub in this exact context, never the feature ("Open Live Hub")."""
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text=T.BTN_OPEN_APP, url=WEBAPP_URL)
+        InlineKeyboardButton(text=label or T.BTN_OPEN_APP, url=WEBAPP_URL)
     ]])
 
 
@@ -205,7 +208,7 @@ async def start(msg: Message):
     # returning player with a team: don't reset them to the quiz
     if existing and existing["team"]:
         await msg.answer(T.WELCOME_BACK.format(team=existing["team"]),
-                         reply_markup=kb_webapp())
+                         reply_markup=kb_webapp(T.BTN_HUB_SCORES))
         return
 
     # ad scent: greeting matches the traffic source (ig_* = Instagram/Meta)
@@ -250,7 +253,7 @@ async def team_chosen(cb: CallbackQuery):
             reply_markup=kb_pick(m))
     else:
         await edit_or_send(cb, T.TEAM_SAVED_NO_MATCH.format(team=team),
-                           kb=kb_webapp())
+                           kb=kb_webapp(T.BTN_HUB_SCHEDULE))
 
 
 # ----------------------------------------------------------------------
@@ -274,7 +277,7 @@ async def pick(cb: CallbackQuery):
     else:
         await cb.message.answer(
             f"Pick locked: <b>{label}</b> 🎯 I'll ping you at the final whistle.",
-            reply_markup=kb_webapp())
+            reply_markup=kb_webapp(T.BTN_HUB_TRACK))
 
 
 @r.message(F.contact)
@@ -285,7 +288,7 @@ async def got_contact(msg: Message):
                       phone=msg.contact.phone_number, awaiting_email=0)
     await capi_lead_once(msg.from_user.id)
     await msg.answer(T.CONTACT_SAVED, reply_markup=ReplyKeyboardRemove())
-    await msg.answer("Live hub 👇", reply_markup=kb_webapp())
+    await msg.answer(T.HUB_AFTER_VERIFY, reply_markup=kb_webapp(T.BTN_HUB_TRACK))
 
 
 @r.message(F.text == T.BTN_VERIFY_SKIP)
@@ -315,7 +318,7 @@ async def maybe_email(msg: Message):
         await db.set_user(msg.from_user.id,
                           email=msg.text.strip().lower(), awaiting_email=0)
         await capi_lead_once(msg.from_user.id)
-        await msg.answer(T.EMAIL_SAVED, reply_markup=kb_webapp())
+        await msg.answer(T.EMAIL_SAVED, reply_markup=kb_webapp(T.BTN_HUB_TRACK))
     else:
         await msg.answer(T.EMAIL_INVALID)
 
@@ -559,6 +562,10 @@ async def sync_fixtures() -> dict:
                 ev["date"].replace("Z", "+00:00")).timestamp())
             mid = await db.upsert_match_ext(str(ev["id"]), t1, t2, kickoff)
             upserted += 1
+            state = ev.get("status", {}).get("type", {}).get("state", "pre")
+            if state == "in":      # in-play: stream the live score to the hub
+                hs, as_ = int(home.get("score", 0)), int(away.get("score", 0))
+                await db.set_match_live(mid, f"{hs}:{as_}", live=1)
             if ev.get("status", {}).get("type", {}).get("completed"):
                 local = await db.get_match(mid)
                 if local and not local["result"]:
@@ -569,6 +576,7 @@ async def sync_fixtures() -> dict:
                         res = "2"
                     else:
                         res = "1" if hs > as_ else ("2" if as_ > hs else "X")
+                    await db.set_match_live(mid, f"{hs}:{as_}", live=0)
                     await do_settle(mid, res, f"{hs}:{as_}")
                     settled += 1
                     log.info("auto-settled match %s (%s:%s)", mid, hs, as_)
@@ -635,9 +643,14 @@ async def scheduler():
                 await db.weekly_reset()
                 await db.meta_set("week_start", str(week_start + 7 * DAY))
 
-            # 0a) fixtures auto-sync (also auto-settles + win/loss pushes)
-            if now - int(await db.meta_get("last_sync", "0")) >= \
-                    SYNC_INTERVAL_MIN * 60:
+            # 0a) fixtures auto-sync (also auto-settles + win/loss pushes).
+            # While a match is in play the hub promises LIVE scores — poll
+            # ESPN every LIVE_SYNC_MIN instead of the idle cadence.
+            in_play = await db.any_live() or await db.matches_where(
+                "result IS NULL AND kickoff <= ? AND kickoff > ?",
+                (now, now - 3 * HOUR))
+            interval = (LIVE_SYNC_MIN if in_play else SYNC_INTERVAL_MIN) * 60
+            if now - int(await db.meta_get("last_sync", "0")) >= interval:
                 await sync_fixtures()
                 await db.meta_set("last_sync", str(now))
 
@@ -723,7 +736,7 @@ async def scheduler():
                     "AND last_pick_at < ?", (now - 6 * HOUR,)):
                 await safe_send(u["tg_id"],
                                 T.WEBAPP_NUDGE.format(name=u["name"]),
-                                reply_markup=kb_webapp())
+                                reply_markup=kb_webapp(T.BTN_HUB_RANK))
                 await db.set_user(u["tg_id"], webapp_nudged=1)
 
             # 5) 4h reminder for users without a team
@@ -814,7 +827,8 @@ async def api_matches(request):
         "id": m["id"], "t1": m["t1"], "t2": m["t2"],
         "kickoff": m["kickoff"], "result": m["result"], "score": m["score"],
         "status": "settled" if m["result"] else
-                  ("live" if m["kickoff"] <= now else "upcoming"),
+                  ("live" if (m["is_live"] or m["kickoff"] <= now)
+                   else "upcoming"),
         "my_pick": picks.get(m["id"]),
     } for m in rows])
 
