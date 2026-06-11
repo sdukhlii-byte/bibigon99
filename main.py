@@ -405,6 +405,37 @@ async def stats(msg: Message):
     await msg.answer("\n".join(lines))
 
 
+@r.message(Command("export"))
+async def export_cmd(msg: Message):
+    """Admin: dump all users as CSV — feeds ESP imports, Meta custom
+    audiences and SMS retargeting. Contains personal data: handle per GDPR."""
+    if not admin(msg):
+        return
+    import csv
+    import io
+    from aiogram.types import BufferedInputFile
+    rows = await db.all_users()
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["tg_id", "name", "team", "phone", "email", "source",
+                "registered", "correct", "total", "week_correct",
+                "week_total", "streak", "blocked", "created_at"])
+    for u in rows:
+        w.writerow([u["tg_id"], u["name"], u["team"], u["phone"], u["email"],
+                    u["source"], u["registered"], u["correct"], u["total"],
+                    u["week_correct"], u["week_total"], u["streak"],
+                    u["blocked"],
+                    time.strftime("%Y-%m-%d %H:%M",
+                                  time.gmtime(u["created_at"] or 0))])
+    data = buf.getvalue().encode("utf-8-sig")     # BOM so Excel opens UTF-8
+    fname = f"leads_{time.strftime('%Y%m%d_%H%M')}.csv"
+    await msg.answer_document(
+        BufferedInputFile(data, filename=fname),
+        caption=f"📦 {len(rows)} users · phones: "
+                f"{sum(1 for u in rows if u['phone'])} · emails: "
+                f"{sum(1 for u in rows if u['email'])}")
+
+
 @r.message(Command("broadcast"))
 async def broadcast(msg: Message):
     if not admin(msg):
