@@ -36,8 +36,12 @@ PRELANDING_URL = os.getenv("PRELANDING_URL", "https://example.com")
 TRACKER_URL = os.getenv("TRACKER_URL", "")   # Keitaro campaign URL; if set, bridge goes through it
 WEBAPP_URL = os.getenv("WEBAPP_URL", PRELANDING_URL)
 POSTBACK_SECRET = os.getenv("POSTBACK_SECRET", "change-me")
-FOOTBALL_API_KEY = os.getenv("FOOTBALL_API_KEY", "")   # api-sports.io (API-Football v3) key
-FOOTBALL_LEAGUE_ID = os.getenv("FOOTBALL_LEAGUE_ID", "1")   # 1 = FIFA World Cup
+FOOTBALL_PROVIDER = os.getenv("FOOTBALL_PROVIDER", "espn")
+# espn        — no key needed, public scoreboard endpoint (default)
+# footballdata — football-data.org, free tier includes World Cup, set FOOTBALL_API_KEY
+# apisports   — api-sports.io v3, paid plan required for season 2026, set FOOTBALL_API_KEY
+FOOTBALL_API_KEY = os.getenv("FOOTBALL_API_KEY", "")
+FOOTBALL_LEAGUE_ID = os.getenv("FOOTBALL_LEAGUE_ID", "1")   # apisports: 1 = FIFA World Cup
 FOOTBALL_SEASON = os.getenv("FOOTBALL_SEASON", "2026")
 NEWS_RSS_URL = os.getenv("NEWS_RSS_URL",
                          "https://feeds.bbci.co.uk/sport/football/rss.xml")
@@ -96,6 +100,18 @@ def kb_contact() -> ReplyKeyboardMarkup:
         resize_keyboard=True, one_time_keyboard=True)
 
 
+def kb_main() -> ReplyKeyboardMarkup:
+    """Persistent menu under the input field — core funnel always visible."""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=T.BTN_MENU_PICK),
+             KeyboardButton(text=T.BTN_MENU_STATS)],
+            [KeyboardButton(text=T.BTN_MENU_NEWS),
+             KeyboardButton(text=T.BTN_MENU_HUB)],
+        ],
+        resize_keyboard=True, is_persistent=True)
+
+
 def kb_webapp() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text=T.BTN_OPEN_APP, url=WEBAPP_URL)
@@ -138,6 +154,10 @@ async def team_chosen(cb: CallbackQuery):
     else:
         await cb.message.edit_text(T.TEAM_SAVED_NO_MATCH.format(team=team),
                                    reply_markup=kb_webapp())
+    # proactive capture: ask for verification right here, in onboarding
+    user = await db.get_user(cb.from_user.id)
+    if user and not user["phone"] and not user["email"]:
+        await cb.message.answer(T.VERIFY_PUSH, reply_markup=kb_contact())
 
 
 # ----------------------------------------------------------------------
@@ -167,14 +187,36 @@ async def got_contact(msg: Message):
         return
     await db.set_user(msg.from_user.id,
                       phone=msg.contact.phone_number, awaiting_email=0)
-    await msg.answer(T.CONTACT_SAVED, reply_markup=ReplyKeyboardRemove())
-    await msg.answer("Live hub 👇", reply_markup=kb_webapp())
+    await msg.answer(T.CONTACT_SAVED, reply_markup=kb_main())
 
 
 @r.message(F.text == T.BTN_VERIFY_SKIP)
 async def contact_skipped(msg: Message):
     await db.set_user(msg.from_user.id, awaiting_email=1)
-    await msg.answer(T.ASK_EMAIL_FALLBACK, reply_markup=ReplyKeyboardRemove())
+    await msg.answer(T.ASK_EMAIL_FALLBACK, reply_markup=kb_main())
+
+
+# ---------- persistent menu routing ----------
+
+@r.message(F.text == T.BTN_MENU_PICK)
+async def menu_pick(msg: Message):
+    await schedule_cmd(msg)
+
+
+@r.message(F.text == T.BTN_MENU_STATS)
+async def menu_stats(msg: Message):
+    await mystats_cmd(msg)
+
+
+@r.message(F.text == T.BTN_MENU_NEWS)
+async def menu_news(msg: Message):
+    await news_cmd(msg)
+
+
+@r.message(F.text == T.BTN_MENU_HUB)
+async def menu_hub(msg: Message):
+    await msg.answer("Live scores, league, and the PLAY tab 👇",
+                     reply_markup=kb_webapp())
 
 
 @r.message(Command("skip"))
@@ -197,7 +239,7 @@ async def maybe_email(msg: Message):
     if EMAIL_RE.match(msg.text.strip()):
         await db.set_user(msg.from_user.id,
                           email=msg.text.strip().lower(), awaiting_email=0)
-        await msg.answer(T.EMAIL_SAVED, reply_markup=kb_webapp())
+        await msg.answer(T.EMAIL_SAVED, reply_markup=kb_main())
     else:
         await msg.answer(T.EMAIL_INVALID)
 
@@ -365,54 +407,142 @@ async def mystats_cmd(msg: Message):
 FINISHED_STATUSES = {"FT", "AET", "PEN"}   # api-sports fixture status codes
 
 
-async def sync_fixtures() -> dict:
-    """Pull World Cup fixtures/results from API-Sports v3 and auto-settle.
-    Returns a summary dict for logging / the /sync admin command."""
-    if not FOOTBALL_API_KEY:
-        return {"error": "FOOTBALL_API_KEY is not set"}
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.get(
-                    "https://v3.football.api-sports.io/fixtures",
-                    params={"league": FOOTBALL_LEAGUE_ID,
-                            "season": FOOTBALL_SEASON},
-                    headers={"x-apisports-key": FOOTBALL_API_KEY},
-                    timeout=20) as resp:
-                data = await resp.json()
-    except Exception as e:
-        log.warning("fixtures sync failed: %s", e)
-        return {"error": str(e)}
-    if data.get("errors"):
-        log.warning("api-sports errors: %s", data["errors"])
-        return {"error": str(data["errors"])}
+async def _process_fixture(ext_id: str, t1: str, t2: str, kickoff: int,
+                           finished: bool, res: str | None,
+                           score: str | None, counters: dict):
+    """Shared upsert + auto-settle for every provider."""
+    mid = await db.upsert_match_ext(ext_id, t1, t2, kickoff)
+    counters["fixtures"] += 1
+    if finished and res and score:
+        local = await db.get_match(mid)
+        if local and not local["result"]:
+            await do_settle(mid, res, score)
+            counters["settled"] += 1
+            log.info("auto-settled match %s", mid)
 
+
+async def _fetch_json(url: str, headers=None, params=None):
+    async with aiohttp.ClientSession() as s:
+        async with s.get(url, headers=headers, params=params,
+                         timeout=20) as resp:
+            return await resp.json()
+
+
+async def _sync_espn(counters: dict):
+    """ESPN public scoreboard — no API key required."""
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    dates = (f"{(now - timedelta(days=3)).strftime('%Y%m%d')}"
+             f"-{(now + timedelta(days=45)).strftime('%Y%m%d')}")
+    data = await _fetch_json(
+        "https://site.api.espn.com/apis/site/v2/sports/soccer/"
+        "fifa.world/scoreboard", params={"dates": dates, "limit": "400"})
+    for ev in data.get("events", []):
+        try:
+            comp = ev["competitions"][0]
+            home = next(c for c in comp["competitors"]
+                        if c["homeAway"] == "home")
+            away = next(c for c in comp["competitors"]
+                        if c["homeAway"] == "away")
+            kickoff = int(datetime.fromisoformat(
+                ev["date"].replace("Z", "+00:00")).timestamp())
+            finished = bool(ev["status"]["type"].get("completed"))
+            res = score = None
+            if finished:
+                if home.get("winner"):
+                    res = "1"
+                elif away.get("winner"):
+                    res = "2"
+                else:
+                    res = "X"
+                score = f"{home.get('score', '?')}:{away.get('score', '?')}"
+            await _process_fixture(
+                f"espn_{ev['id']}", home["team"]["displayName"],
+                away["team"]["displayName"], kickoff, finished, res, score,
+                counters)
+        except Exception:
+            log.exception("bad espn event")
+
+
+async def _sync_footballdata(counters: dict):
+    """football-data.org v4 — free tier includes the World Cup (WC)."""
+    import calendar as _cal
+    data = await _fetch_json(
+        "https://api.football-data.org/v4/competitions/WC/matches",
+        headers={"X-Auth-Token": FOOTBALL_API_KEY})
+    if data.get("errorCode") or data.get("message") and not data.get("matches"):
+        raise RuntimeError(data.get("message", "football-data error"))
+    for m in data.get("matches", []):
+        try:
+            kickoff = _cal.timegm(
+                time.strptime(m["utcDate"], "%Y-%m-%dT%H:%M:%SZ"))
+            finished = m.get("status") == "FINISHED"
+            res = score = None
+            if finished:
+                res = {"HOME_TEAM": "1", "AWAY_TEAM": "2",
+                       "DRAW": "X"}.get(m["score"].get("winner"))
+                ft = m["score"].get("fullTime", {})
+                if ft.get("home") is not None:
+                    score = f"{ft['home']}:{ft['away']}"
+            await _process_fixture(
+                f"fd_{m['id']}",
+                m["homeTeam"].get("name") or m["homeTeam"].get("tla") or "TBD",
+                m["awayTeam"].get("name") or m["awayTeam"].get("tla") or "TBD",
+                kickoff, finished, res, score, counters)
+        except Exception:
+            log.exception("bad footballdata row")
+
+
+async def _sync_apisports(counters: dict):
+    """api-sports.io v3 — paid plan needed for season 2026."""
     from datetime import datetime
-    upserted = settled = 0
+    data = await _fetch_json(
+        "https://v3.football.api-sports.io/fixtures",
+        headers={"x-apisports-key": FOOTBALL_API_KEY},
+        params={"league": FOOTBALL_LEAGUE_ID, "season": FOOTBALL_SEASON})
+    if data.get("errors"):
+        raise RuntimeError(str(data["errors"]))
     for row in data.get("response", []):
         try:
             fx, teams, goals = row["fixture"], row["teams"], row["goals"]
-            t1 = teams["home"]["name"] or "TBD"
-            t2 = teams["away"]["name"] or "TBD"
-            kickoff = int(datetime.fromisoformat(fx["date"]).timestamp())
-            mid = await db.upsert_match_ext(str(fx["id"]), t1, t2, kickoff)
-            upserted += 1
-            if fx["status"]["short"] in FINISHED_STATUSES:
-                local = await db.get_match(mid)
-                if local and not local["result"] \
-                        and goals.get("home") is not None:
-                    if teams["home"].get("winner"):
-                        res = "1"
-                    elif teams["away"].get("winner"):
-                        res = "2"
-                    else:
-                        res = "X"
-                    await do_settle(mid, res,
-                                    f"{goals['home']}:{goals['away']}")
-                    settled += 1
-                    log.info("auto-settled match %s", mid)
+            kickoff = int(
+                datetime.fromisoformat(fx["date"]).timestamp())
+            finished = fx["status"]["short"] in FINISHED_STATUSES
+            res = score = None
+            if finished and goals.get("home") is not None:
+                if teams["home"].get("winner"):
+                    res = "1"
+                elif teams["away"].get("winner"):
+                    res = "2"
+                else:
+                    res = "X"
+                score = f"{goals['home']}:{goals['away']}"
+            await _process_fixture(
+                f"as_{fx['id']}", teams["home"]["name"] or "TBD",
+                teams["away"]["name"] or "TBD", kickoff, finished, res,
+                score, counters)
         except Exception:
-            log.exception("bad fixture row")
-    return {"fixtures": upserted, "settled": settled}
+            log.exception("bad apisports row")
+
+
+PROVIDERS = {"espn": _sync_espn, "footballdata": _sync_footballdata,
+             "apisports": _sync_apisports}
+
+
+async def sync_fixtures() -> dict:
+    """Pull fixtures/results from the configured provider and auto-settle."""
+    fn = PROVIDERS.get(FOOTBALL_PROVIDER)
+    if not fn:
+        return {"error": f"unknown FOOTBALL_PROVIDER '{FOOTBALL_PROVIDER}'"}
+    if FOOTBALL_PROVIDER != "espn" and not FOOTBALL_API_KEY:
+        return {"error": f"{FOOTBALL_PROVIDER} needs FOOTBALL_API_KEY"}
+    counters = {"fixtures": 0, "settled": 0}
+    try:
+        await fn(counters)
+    except Exception as e:
+        log.warning("fixtures sync failed: %s", e)
+        return {"error": str(e)}
+    return counters
 
 
 @r.message(Command("sync"))
@@ -423,10 +553,10 @@ async def sync_cmd(msg: Message):
     res = await sync_fixtures()
     await db.meta_set("last_sync", str(int(time.time())))
     if "error" in res:
-        await msg.answer(f"⚠️ Sync error: {res['error']}")
+        await msg.answer(f"⚠️ Sync error ({FOOTBALL_PROVIDER}): {res['error']}")
     else:
-        await msg.answer(f"✅ Synced {res['fixtures']} fixtures, "
-                         f"auto-settled {res['settled']}.")
+        await msg.answer(f"✅ [{FOOTBALL_PROVIDER}] Synced {res['fixtures']} "
+                         f"fixtures, auto-settled {res['settled']}.")
 
 
 # ----------------------------------------------------------------------
@@ -504,6 +634,16 @@ async def scheduler():
                         await safe_send(u["tg_id"], fn(u, n_conv), reply_markup=kb)
                         await db.set_user(u["tg_id"], cascade_step=step)
                         break    # one step per tick
+
+            # 3.5) verification nudge: 24h in, no phone, no email — one time
+            for u in await db.all_users(
+                    "team IS NOT NULL AND phone IS NULL AND email IS NULL "
+                    "AND verify_nudged=0 AND created_at < ?",
+                    (now - DAY,)):
+                await safe_send(u["tg_id"],
+                                T.VERIFY_NUDGE.format(name=u["name"]),
+                                reply_markup=kb_contact())
+                await db.set_user(u["tg_id"], verify_nudged=1)
 
             # 4) re-hook quiet predictors: 3+ days since last pick
             upcoming = await db.matches_where(
