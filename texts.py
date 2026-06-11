@@ -78,6 +78,30 @@ REHOOK = (
     "so this week is anyone's game. Next match is waiting for your call."
 )
 
+# ---------- content layer: schedule / news / stats ----------
+
+SCHEDULE_HEADER = "📅 <b>Upcoming World Cup matches</b>\n"
+SCHEDULE_ROW = "{when} — <b>{t1} vs {t2}</b>{picked}"
+SCHEDULE_EMPTY = "No upcoming matches in the calendar yet — check back soon ⚽"
+SCHEDULE_FOOTER = "\nTap /news for today's headlines · your stats: /mystats"
+
+NEWS_HEADER = "⚽ <b>Football today</b>\n"
+NEWS_FOOTER = (
+    "\nWhile everyone's reading, the sharp ones are calling results — "
+    "next match: /schedule 🎯"
+)
+NEWS_EMPTY = "Couldn't reach the newsroom right now — try again in a minute."
+
+MYSTATS = (
+    "📊 <b>Your league card</b>\n\n"
+    "Team: <b>{team}</b>\n"
+    "Picks: <b>{total}</b> · Correct: <b>{correct}</b> ({accuracy}%)\n"
+    "Current streak: <b>{streak}</b> 🔥\n"
+    "League rank: <b>#{rank}</b>\n\n"
+    "Top 10 split the weekly 500 USDT pool. Keep climbing."
+)
+MYSTATS_EMPTY = "No picks yet — your card is empty. Fix that: /schedule"
+
 EMAIL_SAVED = (
     "Done ✅ You're prize-eligible.\n\n"
     "I'll ping you the moment the final whistle blows. Good luck — "

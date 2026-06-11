@@ -36,6 +36,10 @@ PRELANDING_URL = os.getenv("PRELANDING_URL", "https://example.com")
 TRACKER_URL = os.getenv("TRACKER_URL", "")   # Keitaro campaign URL; if set, bridge goes through it
 WEBAPP_URL = os.getenv("WEBAPP_URL", PRELANDING_URL)
 POSTBACK_SECRET = os.getenv("POSTBACK_SECRET", "change-me")
+FOOTBALL_API_KEY = os.getenv("FOOTBALL_API_KEY", "")   # football-data.org token
+NEWS_RSS_URL = os.getenv("NEWS_RSS_URL",
+                         "https://feeds.bbci.co.uk/sport/football/rss.xml")
+DIGEST_HOUR_UTC = int(os.getenv("DIGEST_HOUR_UTC", 9))
 
 EMAIL_RE = re.compile(r"^[\w.+-]+@[\w-]+\.[\w.]+$")
 HOUR, DAY = 3600, 86400
@@ -231,6 +235,30 @@ async def addmatch(msg: Message):
         await msg.answer(f"Format: /addmatch Team1;Team2;YYYY-MM-DD HH:MM\n({e})")
 
 
+async def do_settle(mid: int, result: str, score: str) -> int:
+    """Score predictions, push results, fire bridge triggers. Returns count."""
+    m = await db.get_match(mid)
+    rows = await db.settle_match(mid, result, score)
+    for uid, ok in rows:
+        u = await db.get_user(uid)
+        if ok:
+            await safe_send(uid, T.RESULT_WIN.format(
+                t1=m["t1"], t2=m["t2"], score=score,
+                points=10, streak=u["streak"]))
+            if u["streak"] >= 3 and not u["registered"]:
+                await fire_bridge(uid, T.TRIGGER_STREAK.format(
+                    name=u["name"], streak=u["streak"]), T.BRIDGE_BUTTON)
+        else:
+            await safe_send(uid, T.RESULT_LOSS.format(
+                t1=m["t1"], t2=m["t2"], score=score))
+            if u["total"] >= 4 and u["correct"] / u["total"] <= 0.25 \
+                    and not u["registered"]:
+                await fire_bridge(uid, T.TRIGGER_COLDSTREAK.format(
+                    correct=u["correct"], total=u["total"]), T.BRIDGE_BUTTON)
+        await asyncio.sleep(0.05)
+    return len(rows)
+
+
 @r.message(Command("settle"))
 async def settle(msg: Message):
     """/settle <match_id> <1|X|2> <score>   e.g. /settle 3 1 2:1"""
@@ -238,27 +266,9 @@ async def settle(msg: Message):
         return
     try:
         _, mid, result, score = msg.text.split()
-        m = await db.get_match(int(mid))
-        rows = await db.settle_match(int(mid), result, score)
-        n_conv = await db.converted_count()
-        for uid, ok in rows:
-            u = await db.get_user(uid)
-            if ok:
-                await safe_send(uid, T.RESULT_WIN.format(
-                    t1=m["t1"], t2=m["t2"], score=score,
-                    points=10, streak=u["streak"]))
-                if u["streak"] >= 3 and not u["registered"]:
-                    await fire_bridge(uid, T.TRIGGER_STREAK.format(
-                        name=u["name"], streak=u["streak"]), T.BRIDGE_BUTTON)
-            else:
-                await safe_send(uid, T.RESULT_LOSS.format(
-                    t1=m["t1"], t2=m["t2"], score=score))
-                if u["total"] >= 4 and u["correct"] / u["total"] <= 0.25 \
-                        and not u["registered"]:
-                    await fire_bridge(uid, T.TRIGGER_COLDSTREAK.format(
-                        correct=u["correct"], total=u["total"]), T.BRIDGE_BUTTON)
-        await msg.answer(f"Settled #{mid}: {len(rows)} predictions scored. "
-                         f"Converted so far: {n_conv}")
+        n = await do_settle(int(mid), result, score)
+        await msg.answer(f"Settled #{mid}: {n} predictions scored. "
+                         f"Converted so far: {await db.converted_count()}")
     except Exception as e:
         await msg.answer(f"Format: /settle <id> <1|X|2> <score>\n({e})")
 
@@ -285,6 +295,106 @@ async def broadcast(msg: Message):
 
 
 # ----------------------------------------------------------------------
+# CONTENT LAYER — schedule, news, personal stats
+# ----------------------------------------------------------------------
+import calendar
+import xml.etree.ElementTree as ET
+
+import aiohttp
+
+
+@r.message(Command("schedule"))
+async def schedule_cmd(msg: Message):
+    now = int(time.time())
+    rows = await db.matches_where(
+        "result IS NULL AND kickoff > ? ORDER BY kickoff LIMIT 10", (now,))
+    if not rows:
+        await msg.answer(T.SCHEDULE_EMPTY)
+        return
+    picks = await db.user_picks(msg.from_user.id)
+    lines = [T.SCHEDULE_HEADER]
+    for m in rows:
+        when = time.strftime("%d %b %H:%M", time.gmtime(m["kickoff"]))
+        picked = "  ✅" if m["id"] in picks else ""
+        lines.append(T.SCHEDULE_ROW.format(
+            when=when, t1=m["t1"], t2=m["t2"], picked=picked))
+    lines.append(T.SCHEDULE_FOOTER)
+    await msg.answer("\n".join(lines), reply_markup=kb_pick(rows[0]))
+
+
+async def fetch_news(n: int = 3):
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(NEWS_RSS_URL, timeout=15) as resp:
+                text = await resp.text()
+        items = ET.fromstring(text).findall(".//item")[:n]
+        return [(i.findtext("title", ""), i.findtext("link", ""))
+                for i in items]
+    except Exception as e:
+        log.warning("news fetch failed: %s", e)
+        return []
+
+
+def format_news(items) -> str:
+    body = "\n".join(f"• <a href=\"{link}\">{title}</a>"
+                     for title, link in items)
+    return T.NEWS_HEADER + body + T.NEWS_FOOTER
+
+
+@r.message(Command("news"))
+async def news_cmd(msg: Message):
+    items = await fetch_news(5)
+    await msg.answer(format_news(items) if items else T.NEWS_EMPTY,
+                     disable_web_page_preview=True)
+
+
+@r.message(Command("mystats"))
+async def mystats_cmd(msg: Message):
+    u = await db.get_user(msg.from_user.id)
+    if not u or not u["total"]:
+        await msg.answer(T.MYSTATS_EMPTY)
+        return
+    await msg.answer(T.MYSTATS.format(
+        team=u["team"] or "—", total=u["total"], correct=u["correct"],
+        accuracy=round(100 * u["correct"] / u["total"]),
+        streak=u["streak"], rank=await db.user_rank(msg.from_user.id)))
+
+
+async def sync_fixtures():
+    """Pull World Cup fixtures/results from football-data.org and auto-settle."""
+    if not FOOTBALL_API_KEY:
+        return
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(
+                    "https://api.football-data.org/v4/competitions/WC/matches",
+                    headers={"X-Auth-Token": FOOTBALL_API_KEY},
+                    timeout=20) as resp:
+                data = await resp.json()
+    except Exception as e:
+        log.warning("fixtures sync failed: %s", e)
+        return
+    for m in data.get("matches", []):
+        try:
+            t1 = m["homeTeam"].get("name") or m["homeTeam"].get("tla") or "TBD"
+            t2 = m["awayTeam"].get("name") or m["awayTeam"].get("tla") or "TBD"
+            kickoff = calendar.timegm(
+                time.strptime(m["utcDate"], "%Y-%m-%dT%H:%M:%SZ"))
+            mid = await db.upsert_match_ext(str(m["id"]), t1, t2, kickoff)
+            if m.get("status") == "FINISHED":
+                local = await db.get_match(mid)
+                if local and not local["result"]:
+                    res = {"HOME_TEAM": "1", "AWAY_TEAM": "2",
+                           "DRAW": "X"}.get(m["score"].get("winner"))
+                    ft = m["score"].get("fullTime", {})
+                    if res and ft.get("home") is not None:
+                        await do_settle(mid, res, f"{ft['home']}:{ft['away']}")
+                        log.info("auto-settled match %s", mid)
+        except Exception:
+            log.exception("bad fixture row")
+
+
+# ----------------------------------------------------------------------
 # SCHEDULER — announcements, matchday bridges, drip cascade
 # ----------------------------------------------------------------------
 CASCADE = [           # (delay since bridge_clicked_at, step index, text fn)
@@ -301,6 +411,24 @@ async def scheduler():
     while True:
         try:
             now = int(time.time())
+
+            # 0a) fixtures auto-sync every 30 min (also auto-settles)
+            if now - int(await db.meta_get("last_sync", "0")) >= 1800:
+                await sync_fixtures()
+                await db.meta_set("last_sync", str(now))
+
+            # 0b) daily news digest at DIGEST_HOUR_UTC
+            today = time.strftime("%Y-%m-%d", time.gmtime(now))
+            if time.gmtime(now).tm_hour == DIGEST_HOUR_UTC and \
+                    await db.meta_get("digest_date") != today:
+                items = await fetch_news(3)
+                if items:
+                    text = format_news(items)
+                    for u in await db.all_users("team IS NOT NULL"):
+                        await safe_send(u["tg_id"], text,
+                                        disable_web_page_preview=True)
+                        await asyncio.sleep(0.05)
+                await db.meta_set("digest_date", today)
 
             # 1) announce new matches (kickoff within 24h, not announced)
             for m in await db.matches_where(
@@ -368,6 +496,102 @@ async def scheduler():
 
 
 # ----------------------------------------------------------------------
+# MINI APP REST API — consumed by the Lovable web app
+# Auth: X-Telegram-Init-Data header, verified per Telegram WebApp spec
+# ----------------------------------------------------------------------
+import hashlib
+import hmac
+import json
+from urllib.parse import parse_qsl
+
+
+def verify_init_data(init_data: str):
+    """Returns tg user id if signature is valid, else None."""
+    try:
+        data = dict(parse_qsl(init_data, keep_blank_values=True))
+        received_hash = data.pop("hash")
+        check_string = "\n".join(f"{k}={v}" for k, v in sorted(data.items()))
+        secret = hmac.new(b"WebAppData", BOT_TOKEN.encode(),
+                          hashlib.sha256).digest()
+        calc = hmac.new(secret, check_string.encode(),
+                        hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(calc, received_hash):
+            return None
+        return json.loads(data["user"])["id"]
+    except Exception:
+        return None
+
+
+@web.middleware
+async def cors(request, handler):
+    if request.method == "OPTIONS":
+        resp = web.Response()
+    else:
+        resp = await handler(request)
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Headers"] = \
+        "Content-Type, X-Telegram-Init-Data"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    return resp
+
+
+def api_uid(request) -> int | None:
+    return verify_init_data(request.headers.get("X-Telegram-Init-Data", ""))
+
+
+async def api_me(request):
+    uid = api_uid(request)
+    if not uid:
+        return web.json_response({"error": "unauthorized"}, status=401)
+    u = await db.get_user(uid)
+    if not u:
+        return web.json_response({"error": "start the bot first"}, status=404)
+    return web.json_response({
+        "name": u["name"], "team": u["team"],
+        "correct": u["correct"], "total": u["total"], "streak": u["streak"],
+        "accuracy": round(100 * u["correct"] / u["total"]) if u["total"] else None,
+        "registered": bool(u["registered"]),
+    })
+
+
+async def api_matches(request):
+    uid = api_uid(request)
+    picks = await db.user_picks(uid) if uid else {}
+    now = int(time.time())
+    rows = await db.matches_where(
+        "kickoff > ? OR result IS NOT NULL", (now - 2 * DAY,))
+    return web.json_response([{
+        "id": m["id"], "t1": m["t1"], "t2": m["t2"],
+        "kickoff": m["kickoff"], "result": m["result"], "score": m["score"],
+        "status": "settled" if m["result"] else
+                  ("live" if m["kickoff"] <= now else "upcoming"),
+        "my_pick": picks.get(m["id"]),
+    } for m in rows])
+
+
+async def api_predict(request):
+    uid = api_uid(request)
+    if not uid:
+        return web.json_response({"error": "unauthorized"}, status=401)
+    body = await request.json()
+    mid, pick = int(body.get("match_id", 0)), body.get("pick")
+    m = await db.get_match(mid)
+    if not m or m["result"] or m["kickoff"] <= int(time.time()) \
+            or pick not in ("1", "X", "2"):
+        return web.json_response({"error": "match closed"}, status=400)
+    first = await db.save_prediction(uid, mid, pick)
+    return web.json_response({"ok": True, "first_prediction": first})
+
+
+async def api_leaderboard(request):
+    rows = await db.leaderboard(20)
+    return web.json_response([{
+        "rank": i + 1, "name": r["name"], "team": r["team"],
+        "correct": r["correct"], "total": r["total"], "streak": r["streak"],
+    } for i, r in enumerate(rows)])
+
+
+# ----------------------------------------------------------------------
 # POSTBACK SERVER — affiliate / site calls this on registration
 # GET /postback?uid=<tg_id>&event=reg&secret=<POSTBACK_SECRET>
 # ----------------------------------------------------------------------
@@ -391,9 +615,14 @@ async def health(_):
 
 
 async def run_web():
-    app = web.Application()
+    app = web.Application(middlewares=[cors])
     app.router.add_get("/postback", postback)
     app.router.add_get("/health", health)
+    app.router.add_get("/api/me", api_me)
+    app.router.add_get("/api/matches", api_matches)
+    app.router.add_post("/api/predict", api_predict)
+    app.router.add_get("/api/leaderboard", api_leaderboard)
+    app.router.add_route("OPTIONS", "/{tail:.*}", lambda r: web.Response())
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", 8080)))
@@ -404,6 +633,13 @@ async def run_web():
 async def main():
     await db.init()
     await run_web()
+    from aiogram.types import BotCommand
+    await bot.set_my_commands([
+        BotCommand(command="schedule", description="📅 Match calendar"),
+        BotCommand(command="news", description="⚽ Football headlines"),
+        BotCommand(command="mystats", description="📊 My league card"),
+        BotCommand(command="verify", description="✅ Verify for prizes"),
+    ])
     asyncio.create_task(scheduler())
     log.info("bot polling started")
     await dp.start_polling(bot)

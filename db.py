@@ -26,11 +26,16 @@ CREATE TABLE IF NOT EXISTS users (
 );
 CREATE TABLE IF NOT EXISTS matches (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    ext_id    TEXT UNIQUE,                   -- football-data.org match id
     t1        TEXT, t2 TEXT,
     kickoff   INTEGER,                       -- unix ts UTC
     result    TEXT,                          -- '1' | 'X' | '2' | NULL
     score     TEXT,                          -- e.g. '2:1'
     announced INTEGER DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS meta (
+    k TEXT PRIMARY KEY,
+    v TEXT
 );
 CREATE TABLE IF NOT EXISTS predictions (
     user_id   INTEGER,
@@ -52,7 +57,56 @@ async def init():
                 await db.execute(f"ALTER TABLE users ADD COLUMN {col} {ddl}")
             except Exception:
                 pass
+        try:
+            await db.execute("ALTER TABLE matches ADD COLUMN ext_id TEXT")
+        except Exception:
+            pass
         await db.commit()
+
+
+async def meta_get(k: str, default: str = "") -> str:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT v FROM meta WHERE k=?", (k,))
+        row = await cur.fetchone()
+        return row[0] if row else default
+
+
+async def meta_set(k: str, v: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO meta (k,v) VALUES (?,?) "
+            "ON CONFLICT(k) DO UPDATE SET v=excluded.v", (k, v))
+        await db.commit()
+
+
+async def upsert_match_ext(ext_id: str, t1: str, t2: str, kickoff: int) -> int:
+    """Insert fixture from the football API or refresh its kickoff time."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT id FROM matches WHERE ext_id=?", (ext_id,))
+        row = await cur.fetchone()
+        if row:
+            await db.execute("UPDATE matches SET kickoff=? WHERE id=?",
+                             (kickoff, row[0]))
+            await db.commit()
+            return row[0]
+        cur = await db.execute(
+            "INSERT INTO matches (ext_id,t1,t2,kickoff) VALUES (?,?,?,?)",
+            (ext_id, t1, t2, kickoff))
+        await db.commit()
+        return cur.lastrowid
+
+
+async def user_rank(uid: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT correct FROM users WHERE tg_id=?", (uid,))
+        row = await cur.fetchone()
+        if not row:
+            return None
+        cur = await db.execute(
+            "SELECT COUNT(*)+1 FROM users WHERE total>0 AND correct>?", (row[0],))
+        (rank,) = await cur.fetchone()
+        return rank
 
 
 async def upsert_user(tg_id: int, name: str):
@@ -165,6 +219,23 @@ async def converted_count() -> int:
         cur = await db.execute("SELECT COUNT(*) FROM users WHERE registered=1")
         (n,) = await cur.fetchone()
         return n
+
+
+async def leaderboard(limit: int = 20):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT name, team, correct, total, streak FROM users "
+            "WHERE total > 0 ORDER BY correct DESC, total ASC LIMIT ?", (limit,))
+        return await cur.fetchall()
+
+
+async def user_picks(uid: int):
+    """match_id -> pick for one user."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT match_id, pick FROM predictions WHERE user_id=?", (uid,))
+        return {mid: pick for mid, pick in await cur.fetchall()}
 
 
 async def stats():

@@ -23,6 +23,9 @@ TG Ads → /start → team pick → first prediction (in-bot)
 | `TRACKER_URL` | `https://track.yourdomain.com/CAMPAIGN_ID` (Keitaro campaign) |
 | `WEBAPP_URL` | `https://t.me/YourBot/app` |
 | `POSTBACK_SECRET` | any long random string |
+| `FOOTBALL_API_KEY` | football-data.org token (free tier) — enables fixture auto-sync |
+| `NEWS_RSS_URL` | optional, defaults to BBC Football RSS |
+| `DIGEST_HOUR_UTC` | optional, daily news digest hour UTC (default 9) |
 
 3. Enable public networking → note the domain for postbacks.
 
@@ -70,12 +73,23 @@ stops the cascade, sends the congrats + deposit-nudge message.
 
 ## Daily ops (admin commands in the bot)
 
+With `FOOTBALL_API_KEY` set, **matches run themselves**: fixtures sync from
+football-data.org every 30 min, announcements go out within 24h of kickoff,
+finished matches auto-settle — results, streaks, and bridge triggers fire
+without you. Admin commands remain as manual override:
+
 | Command | What it does |
 |---|---|
-| `/addmatch Brazil;Argentina;2026-06-15 18:00` | adds match (UTC). Within 24h of kickoff the scheduler announces it to everyone with personalized text for fans of the two teams |
-| `/settle 3 1 2:1` | settles match #3 as home win, score 2:1. Scores all predictions, sends win/loss pushes, fires streak/cold-streak bridge triggers automatically |
-| `/stats` | funnel snapshot: users → team picked → predictors → emails → bridge clicks → registered |
+| `/addmatch Brazil;Argentina;2026-06-15 18:00` | manually add a match (UTC) — only needed without the API key |
+| `/settle 3 1 2:1` | manually settle match #3 (auto-settle covers API matches) |
+| `/stats` | funnel snapshot: users → team picked → predictors → emails → phones → bridge clicks → registered |
 | `/broadcast <text>` | send to everyone (rate-limited) |
+
+User commands (in the bot menu): `/schedule` — next 10 matches with pick
+status and instant pick buttons; `/news` — top football headlines on demand;
+`/mystats` — personal league card with rank; `/verify` — retry prize
+verification. A daily news digest goes to all users at `DIGEST_HOUR_UTC`
+(content touches that keep the selling pushes below 1-in-4).
 
 ## Funnel logic baked in
 
