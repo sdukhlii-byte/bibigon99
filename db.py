@@ -411,6 +411,17 @@ async def user_picks(uid: int):
         return {mid: pick for mid, pick in await cur.fetchall()}
 
 
+async def pending_picks(uid: int) -> int:
+    """Picks on matches not yet settled — the gap between 'made a call'
+    and 'total' (which only counts scored picks)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT COUNT(*) FROM predictions p "
+            "JOIN matches m ON m.id = p.match_id "
+            "WHERE p.user_id=? AND m.result IS NULL", (uid,))
+        return (await cur.fetchone())[0]
+
+
 async def stats():
     async with aiosqlite.connect(DB_PATH) as db:
         q = {

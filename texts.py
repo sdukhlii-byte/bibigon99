@@ -123,6 +123,13 @@ MYSTATS = (
 )
 MYSTATS_EMPTY = "No picks yet — your card is empty. Fix that: /schedule"
 
+MYSTATS_PENDING = (
+    "📊 <b>Your league card</b>\n\n"
+    "{pending} pick(s) locked in, waiting for full time ⏳\n"
+    "Results land here the second the ref blows the whistle.\n\n"
+    "More matches to call: /schedule"
+)
+
 EMAIL_SAVED = (
     "Done ✅ You're prize-eligible.\n\n"
     "I'll ping you the moment the final whistle blows. Good luck — "

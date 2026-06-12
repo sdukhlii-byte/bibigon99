@@ -623,8 +623,12 @@ async def news_cmd(msg: Message):
 @r.message(Command("mystats"))
 async def mystats_cmd(msg: Message):
     u = await db.get_user(msg.from_user.id)
-    if not u or not u["total"]:
+    pending = await db.pending_picks(msg.from_user.id) if u else 0
+    if not u or (not u["total"] and not pending):
         await msg.answer(T.MYSTATS_EMPTY)
+        return
+    if not u["total"]:    # calls made, nothing scored yet — don't say "empty"
+        await msg.answer(T.MYSTATS_PENDING.format(pending=pending))
         return
     await msg.answer(T.MYSTATS.format(
         team=u["team"] or "—", total=u["total"], correct=u["correct"],
@@ -740,7 +744,20 @@ async def _sync_fixtures_inner() -> dict:
                     log.info("auto-settled match %s (%s:%s)", mid, hs, as_)
         except Exception:
             log.exception("bad ESPN event row")
-    return {"fixtures": upserted, "settled": settled}
+
+    # sweep: anything our DB still flags live >4h after kickoff can't be in
+    # play — the final whistle was missed (restart mid-match, ESPN gap, event
+    # out of the window). Clear the flag so any_live() and the hub recover;
+    # the result lands via auto-settle as soon as the event reappears.
+    stale = await db.matches_where(
+        "is_live=1 AND result IS NULL AND kickoff < ?",
+        (int(time.time()) - 4 * HOUR,))
+    for m in stale:
+        await db.set_match_live(m["id"], m["score"] or "", live=0)
+        log.warning("cleared stale live flag: match %s (%s vs %s)",
+                    m["id"], m["t1"], m["t2"])
+    return {"fixtures": upserted, "settled": settled,
+            "stale_cleared": len(stale)}
 
 
 @r.message(Command("sync"))
@@ -1075,6 +1092,7 @@ async def api_me(request):
     return web.json_response({
         "name": u["name"], "team": u["team"],
         "correct": u["correct"], "total": u["total"], "streak": u["streak"],
+        "pending": await db.pending_picks(uid),
         "week_correct": u["week_correct"], "week_total": u["week_total"],
         "accuracy": round(100 * u["correct"] / u["total"]) if u["total"] else None,
         "registered": bool(u["registered"]),
@@ -1091,12 +1109,12 @@ async def api_matches(request):
         "id": m["id"], "t1": m["t1"], "t2": m["t2"],
         "kickoff": m["kickoff"], "result": m["result"], "score": m["score"],
         "odds": m["odds"],
-        # "live" needs a positive signal (ESPN in-play flag) or a recent
-        # kickoff; a fixture that kicked off >4h ago and never settled is
-        # stuck (API gap / abandonment) — don't show it as live forever
+        # hard cap: no football match runs 4 hours. A stale is_live flag
+        # (sync missed the final whistle) must never pin LIVE forever —
+        # past the cap the fixture hides until results arrive.
         "status": "settled" if m["result"] else
-                  ("live" if (m["is_live"] or
-                              now - 4 * HOUR < m["kickoff"] <= now)
+                  ("live" if ((m["is_live"] or m["kickoff"] <= now)
+                              and now - m["kickoff"] < 4 * HOUR)
                    else "upcoming"),
         "my_pick": picks.get(m["id"]),
     } for m in rows])
