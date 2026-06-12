@@ -132,6 +132,16 @@ async def init():
                 "ALTER TABLE matches ADD COLUMN t60_done INTEGER DEFAULT 0")
         except Exception:
             pass
+        try:
+            await db.execute(
+                "ALTER TABLE matches ADD COLUMN kickoff_pushed INTEGER DEFAULT 0")
+        except Exception:
+            pass
+        try:
+            await db.execute(
+                "ALTER TABLE matches ADD COLUMN ft_pushed INTEGER DEFAULT 0")
+        except Exception:
+            pass
         await db.commit()
 
 
@@ -303,6 +313,28 @@ async def mark_t60(mid: int) -> bool:
         return cur.rowcount > 0
 
 
+async def mark_kickoff_pushed(mid: int) -> bool:
+    """Set the kickoff-notified flag; True only for the first caller
+    (race-safe), so the 'match started' push fires exactly once."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "UPDATE matches SET kickoff_pushed=1 "
+            "WHERE id=? AND kickoff_pushed=0", (mid,))
+        await db.commit()
+        return cur.rowcount > 0
+
+
+async def mark_ft_pushed(mid: int) -> bool:
+    """Set the full-time-notified flag; True only for the first caller
+    (race-safe), so the 'final whistle' push fires exactly once."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "UPDATE matches SET ft_pushed=1 "
+            "WHERE id=? AND ft_pushed=0", (mid,))
+        await db.commit()
+        return cur.rowcount > 0
+
+
 async def all_team_form(max_n: int = 3):
     """team name -> 'WDL' string (most recent first), built ONLY from
     settled matches in this tournament. Real results, nothing narrated."""
@@ -427,15 +459,23 @@ async def converted_count() -> int:
 async def leaderboard(limit: int = 20):
     """Weekly league — matches the 'Top 10 every week' prize promise.
     League score = correct calls + referral points (capped in credit_referral);
-    ties break to fewer attempts, then most recent activity."""
+    ties break to fewer attempts, then most recent activity.
+
+    Prize eligibility requires having actually played this week (week_total>0),
+    exactly like weekly_top(). So players who've only *made* a pick that isn't
+    scored yet (or only earned referral points) are listed BELOW everyone
+    eligible — otherwise the visible Top-10 'money line' wouldn't match the
+    rows weekly_top() actually pays out."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
-            "SELECT name, team, week_correct AS correct, week_total AS total, "
-            "streak, week_correct + COALESCE(ref_week_points,0) "
+            "SELECT tg_id, name, team, week_correct AS correct, "
+            "week_total AS total, streak, "
+            "week_correct + COALESCE(ref_week_points,0) "
             "+ COALESCE(week_bonus,0) AS points "
             "FROM users WHERE week_total > 0 OR last_pick_at > 0 "
-            "ORDER BY points DESC, week_total ASC, last_pick_at DESC "
+            "ORDER BY (week_total > 0) DESC, points DESC, "
+            "week_total ASC, last_pick_at DESC "
             "LIMIT ?", (limit,))
         return await cur.fetchall()
 
