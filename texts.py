@@ -185,7 +185,7 @@ EMAIL_SKIPPED = (
 )
 
 RESULT_WIN = (
-    "✅ <b>{t1} {score} {t2}</b> — you called it! +{points} pts.\n"
+    "✅ <b>{t1} {score} {t2}</b> — you called it! <b>+1 league point</b>.\n"
     "Streak: <b>{streak}</b> 🔥 Next match is coming — keep it alive."
 )
 
@@ -301,6 +301,17 @@ GOAL_ALERT = (
     "Your call is <b>{status}</b>"
 )
 
+MATCH_START = (
+    "🟢 <b>Kick-off</b> — {t1} vs {t2}\n\n"
+    "Your call is <b>{side}</b>. It's locked now — track every goal live "
+    "and watch your read play out."
+)
+
+MATCH_FT = (
+    "🏁 <b>Full time</b> — {t1} {score} {t2}\n\n"
+    "Scoring your call now…"
+)
+
 ODDS_LINE = "\n\n📈 Line: <b>{odds}</b>"
 
 STREAK_LINE = "\n🔥 Your <b>{streak}-streak</b> is on the line with this one."
@@ -361,6 +372,19 @@ WEEKLY_WINNER_DM = (
 ADMIN_PAYOUT_SHEET = (
     "💸 <b>Weekly payout sheet</b> — pay today, post proofs:\n\n{sheet}"
 )
+
+ADMIN_LASTRESORT = (
+    "⚠️ <b>Last-resort settle</b> — match #{mid} ({t1} vs {t2}) was scored from "
+    "the stored final score <b>{score}</b> because ESPN never confirmed a "
+    "result. If that score is wrong, override with /settle {mid} &lt;1|X|2&gt; "
+    "&lt;score&gt; (re-settle is blocked once scored, so /void first if needed)."
+)
+
+ADMIN_UNSETTLED_HEADER = "🕒 <b>Unsettled matches past kickoff:</b>\n"
+ADMIN_UNSETTLED_ROW = (
+    "#{mid} · {t1} vs {t2} · {when} · score: {score} · {ext}"
+)
+ADMIN_UNSETTLED_EMPTY = "✅ Nothing stuck — every kicked-off match is settled."
 
 VIP_WELCOME = (
     "👑 <b>Welcome to VIP.</b>\n\nYour channel: {link}\n\n"

@@ -12,6 +12,7 @@ ENV:
 """
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import re
@@ -52,6 +53,12 @@ SYNC_LOOKAHEAD_DAYS = int(os.getenv("SYNC_LOOKAHEAD_DAYS", 30))
 ANNOUNCE_GAP = int(os.getenv("ANNOUNCE_GAP_HOURS", 6)) * 3600  # min gap between announce pushes per user
 SYNC_INTERVAL_MIN = int(os.getenv("SYNC_INTERVAL_MIN", 30))    # idle ESPN poll cadence
 LIVE_POLL_SEC = int(os.getenv("LIVE_POLL_SEC", 20))            # cadence while a match is in play
+# Hard ceiling on how long a fixture may ever be shown LIVE, counted from
+# kickoff: 90' + HT + generous stoppage + ET + penalties + buffer. Past this
+# the match is over no matter what ESPN's stale `state` still says — used both
+# to clear the is_live flag and to gate the hub's "live" status so a finished
+# game can never linger as LIVE.
+LIVE_MAX_AGE = int(os.getenv("LIVE_MAX_AGE_MIN", 150)) * 60    # 2h30m
 VIP_PRICE_STARS = int(os.getenv("VIP_PRICE_STARS", 250))       # Telegram Stars / month
 VIP_CHANNEL_INVITE = os.getenv("VIP_CHANNEL_INVITE", "")       # private VIP channel invite link
 WC_END = os.getenv("WC_END", "2026-07-19")                     # real deadline = honest FOMO
@@ -482,7 +489,7 @@ async def do_settle(mid: int, result: str, score: str) -> int:
                                           streak=u["streak"])
                     if exact else
                     T.RESULT_WIN.format(t1=m["t1"], t2=m["t2"], score=score,
-                                        points=10, streak=u["streak"]))
+                                        streak=u["streak"]))
             # the missed-winnings receipt: their own read, the real line,
             # an exact number they did not collect. Compounds every win.
             if not u["registered"]:
@@ -531,6 +538,51 @@ async def settle(msg: Message):
                          f"Converted so far: {await db.converted_count()}")
     except Exception as e:
         await msg.answer(f"Format: /settle <id> <1|X|2> <score>\n({e})")
+
+
+@r.message(Command("unsettled"))
+async def unsettled_cmd(msg: Message):
+    """Admin: list kicked-off matches with no result yet — the ones stuck on
+    'FT — confirming result'. Shows ids so you can /settle or /void them."""
+    if not admin(msg):
+        return
+    rows = await db.matches_where(
+        "result IS NULL AND kickoff < ? ORDER BY kickoff", (int(time.time()),))
+    if not rows:
+        await msg.answer(T.ADMIN_UNSETTLED_EMPTY)
+        return
+    lines = [T.ADMIN_UNSETTLED_HEADER]
+    for m in rows[:30]:
+        when = time.strftime("%d %b %H:%M", time.gmtime(m["kickoff"]))
+        lines.append(T.ADMIN_UNSETTLED_ROW.format(
+            mid=m["id"], t1=m["t1"], t2=m["t2"], when=when,
+            score=m["score"] or "—",
+            ext=("espn" if m["ext_id"] else "manual")))
+    await msg.answer("\n".join(lines))
+
+
+@r.message(Command("void"))
+async def void_cmd(msg: Message):
+    """/void <match_id> — close a match without scoring anyone (abandoned /
+    cancelled / bad data). Clears it out of the live loop and the hub."""
+    if not admin(msg):
+        return
+    try:
+        _, mid = msg.text.split()
+        m = await db.get_match(int(mid))
+        if not m:
+            await msg.answer(f"No match #{mid}.")
+            return
+        if m["result"]:
+            await msg.answer(
+                f"⚠️ Match #{mid} already has result '{m['result']}'. "
+                f"Voiding won't un-score it.")
+            return
+        await db.void_match(int(mid))
+        await msg.answer(f"Voided #{mid} ({m['t1']} vs {m['t2']}) — no points "
+                         f"scored, removed from live.")
+    except Exception as e:
+        await msg.answer(f"Format: /void <match_id>\n({e})")
 
 
 @r.message(Command("stats"))
@@ -804,6 +856,18 @@ async def _sync_fixtures_inner() -> dict:
                 hs, as_ = int(home.get("score", 0)), int(away.get("score", 0))
                 new_score = f"{hs}:{as_}"
                 prev = (await db.get_match(mid))["score"] or "0:0"
+                # match-start push: fires exactly once, the first poll ESPN
+                # reports this fixture in play. Pickers get their locked call
+                # back in front of them; non-pickers stay silent (no spam).
+                if await db.mark_kickoff_pushed(mid):
+                    local = await db.get_match(mid)
+                    for p in await db.picks_for_match(mid):
+                        side = {"1": local["t1"], "X": "Draw",
+                                "2": local["t2"]}.get(p["pick"], p["pick"])
+                        await safe_send(p["user_id"], T.MATCH_START.format(
+                            t1=local["t1"], t2=local["t2"], side=side),
+                            reply_markup=kb_webapp(T.BTN_HUB_TRACK))
+                        await asyncio.sleep(0.05)
                 await db.set_match_live(mid, new_score, live=1)
                 # ping on EVERY goal — dedupe is the score transition itself
                 # (prev is read before the write, all under SYNC_LOCK).
@@ -830,6 +894,37 @@ async def _sync_fixtures_inner() -> dict:
                             t1=local["t1"], t2=local["t2"], score=new_score,
                             status=st), reply_markup=kb_webapp(T.BTN_HUB_TRACK))
                         await asyncio.sleep(0.05)
+            elif state == "post" and not completed:
+                # ESPN moved the fixture OUT of play but the winner/settlement
+                # payload hasn't landed yet (final whistle, a poll or two
+                # before `completed` flips). Clear the live flag immediately so
+                # the hub stops showing LIVE the moment play ends — the result
+                # lands on the next poll via the `completed` branch below.
+                cur = await db.get_match(mid)
+                if cur and cur["is_live"]:
+                    hs, as_ = int(home.get("score", 0)), int(away.get("score", 0))
+                    await db.set_match_live(
+                        mid, cur["score"] or f"{hs}:{as_}", live=0)
+                # full-time push: the natural "your match ended" moment, fired
+                # exactly once, a poll or two before scoring lands. Pickers get
+                # it; non-pickers stay silent. The result DM (win/loss) follows
+                # from do_settle on the completed branch, so no double-spam for
+                # games that jump straight in -> completed (those skip this).
+                cur = await db.get_match(mid)
+                if cur and cur["kickoff"] <= int(time.time()) \
+                        and await db.mark_ft_pushed(mid):
+                    hs, as_ = int(home.get("score", 0)), int(away.get("score", 0))
+                    ft_score = (cur["score"] or f"{hs}:{as_}")
+                    for p in await db.picks_for_match(mid):
+                        await safe_send(p["user_id"], T.MATCH_FT.format(
+                            t1=cur["t1"], t2=cur["t2"], score=ft_score))
+                        await asyncio.sleep(0.05)
+            elif state not in ("in",):
+                # defensive: any other non-in state (pre re-scheduled, delayed,
+                # unknown) must not leave a stale live flag behind.
+                cur = await db.get_match(mid)
+                if cur and cur["is_live"]:
+                    await db.set_match_live(mid, cur["score"] or "", live=0)
             if ev.get("status", {}).get("type", {}).get("completed"):
                 local = await db.get_match(mid)
                 if local and not local["result"]:
@@ -847,25 +942,27 @@ async def _sync_fixtures_inner() -> dict:
         except Exception:
             log.exception("bad ESPN event row")
 
-    # sweep: anything our DB still flags live >4h after kickoff can't be in
-    # play — the final whistle was missed (restart mid-match, ESPN gap, event
-    # out of the window). Clear the flag so any_live() and the hub recover;
-    # the result lands via auto-settle as soon as the event reappears.
+    # sweep: anything our DB still flags live past LIVE_MAX_AGE after kickoff
+    # can't be in play — the final whistle was missed (restart mid-match, ESPN
+    # gap, event out of the window, or ESPN's `state` stuck on 'in'). Clear the
+    # flag so any_live() and the hub recover; the result lands via auto-settle
+    # / recovery as soon as the event reappears.
     stale = await db.matches_where(
         "is_live=1 AND result IS NULL AND kickoff < ?",
-        (int(time.time()) - 4 * HOUR,))
+        (int(time.time()) - LIVE_MAX_AGE,))
     for m in stale:
         await db.set_match_live(m["id"], m["score"] or "", live=0)
         log.warning("cleared stale live flag: match %s (%s vs %s)",
                     m["id"], m["t1"], m["t2"])
 
     # recovery: matches that ended but never settled (bot restart at the
-    # final whistle, event slipped out of the scoreboard window). Picks on
-    # them sit in limbo and nobody's points move — fetch the event summary
-    # directly by id and settle from it.
+    # final whistle, event slipped out of the scoreboard window, or ESPN never
+    # flips `completed` for a fixture it still served live). Picks on them sit
+    # in limbo and nobody's points move — fetch the event summary directly by
+    # id and settle from it; failing that, fall back to the final live score.
     overdue = await db.matches_where(
         "result IS NULL AND ext_id IS NOT NULL AND kickoff < ?",
-        (int(time.time()) - 3 * HOUR,))
+        (int(time.time()) - LIVE_MAX_AGE,))
     recovered = 0
     for m in overdue[:10]:                     # cap per sync run
         if await recover_match_result(m):
@@ -875,42 +972,64 @@ async def _sync_fixtures_inner() -> dict:
 
 
 async def recover_match_result(m) -> bool:
-    """Settle one overdue match from ESPN's per-event summary endpoint."""
+    """Settle one overdue match. Primary: ESPN's per-event summary (exact and
+    authoritative). Last resort: the final in-play score we already captured —
+    used only when the match is well past full time and ESPN never produced a
+    `completed` result (event-id mismatch, feed gap, abandoned-but-unflagged,
+    or seeded test fixtures). Admins are pinged on a last-resort settle so a
+    wrong score can be corrected with /settle."""
     url = (f"https://site.api.espn.com/apis/site/v2/sports/soccer/"
            f"{ESPN_LEAGUE}/summary")
     try:
         async with aiohttp.ClientSession() as s:
             async with s.get(url, params={"event": m["ext_id"]},
                              timeout=15) as resp:
-                if resp.status != 200:
-                    return False
-                data = await resp.json()
+                data = await resp.json() if resp.status == 200 else None
     except Exception as e:
         log.warning("summary fetch failed for %s: %s", m["ext_id"], e)
-        return False
-    try:
-        comp = (data.get("header", {}).get("competitions") or [{}])[0]
-        st = comp.get("status", {}).get("type", {})
-        if not st.get("completed"):
-            return False
-        home = next(c for c in comp["competitors"]
-                    if c.get("homeAway") == "home")
-        away = next(c for c in comp["competitors"]
-                    if c.get("homeAway") == "away")
-        hs, as_ = int(home.get("score", 0)), int(away.get("score", 0))
-        res = "1" if hs > as_ else ("2" if as_ > hs else "X")
-        if home.get("winner"):
-            res = "1"
-        elif away.get("winner"):
-            res = "2"
-        await db.set_match_live(m["id"], f"{hs}:{as_}", live=0)
-        await do_settle(m["id"], res, f"{hs}:{as_}")
-        log.info("recovered + settled overdue match %s (%s:%s)",
-                 m["id"], hs, as_)
-        return True
-    except Exception:
-        log.exception("bad summary payload for %s", m["ext_id"])
-        return False
+        data = None
+    if data:
+        try:
+            comp = (data.get("header", {}).get("competitions") or [{}])[0]
+            st = comp.get("status", {}).get("type", {})
+            if st.get("completed"):
+                home = next(c for c in comp["competitors"]
+                            if c.get("homeAway") == "home")
+                away = next(c for c in comp["competitors"]
+                            if c.get("homeAway") == "away")
+                hs, as_ = int(home.get("score", 0)), int(away.get("score", 0))
+                res = "1" if hs > as_ else ("2" if as_ > hs else "X")
+                if home.get("winner"):
+                    res = "1"
+                elif away.get("winner"):
+                    res = "2"
+                await db.set_match_live(m["id"], f"{hs}:{as_}", live=0)
+                await do_settle(m["id"], res, f"{hs}:{as_}")
+                log.info("recovered + settled overdue match %s (%s:%s)",
+                         m["id"], hs, as_)
+                return True
+        except Exception:
+            log.exception("bad summary payload for %s", m["ext_id"])
+
+    # Last resort: ESPN gave us no completed result, but the match is well over
+    # and we have the final score from when it was in play. Settle from that so
+    # picks can't sit unscored forever ("FT — confirming result" limbo).
+    now = int(time.time())
+    if m["kickoff"] < now - LIVE_MAX_AGE and m["score"]:
+        mt = re.fullmatch(r"(\d{1,2}):(\d{1,2})", str(m["score"]).strip())
+        if mt:
+            hs, as_ = int(mt.group(1)), int(mt.group(2))
+            res = "1" if hs > as_ else ("2" if as_ > hs else "X")
+            await db.set_match_live(m["id"], f"{hs}:{as_}", live=0)
+            n = await do_settle(m["id"], res, f"{hs}:{as_}")
+            if n >= 0:
+                log.warning("last-resort settle match %s from stored score %s",
+                            m["id"], m["score"])
+                for aid in ADMIN_IDS:
+                    await safe_send(aid, T.ADMIN_LASTRESORT.format(
+                        mid=m["id"], t1=m["t1"], t2=m["t2"], score=m["score"]))
+            return True
+    return False
 
 
 @r.message(Command("sync"))
@@ -1235,7 +1354,6 @@ async def scheduler():
 # ----------------------------------------------------------------------
 import hashlib
 import hmac
-import json
 from urllib.parse import parse_qsl
 
 
@@ -1303,21 +1421,56 @@ async def api_matches(request):
     now = int(time.time())
     rows = await db.matches_where(
         "kickoff > ? OR result IS NOT NULL", (now - 2 * DAY,))
+
+    def _status(m):
+        if m["result"]:
+            return "settled"
+        # LIVE is driven by the real ESPN in-play flag, NOT by "kickoff has
+        # passed". A finished match clears is_live the moment ESPN leaves the
+        # 'in' state (see sync: post/completed branches), so it can never pin
+        # LIVE for hours. A short grace right after kickoff covers the gap
+        # before the first in-play poll lands; the LIVE_MAX_AGE cap guarantees
+        # nothing is ever shown live past extra-time + penalties even if ESPN's
+        # `state` is stale or the event vanished from the feed mid-match.
+        age = now - m["kickoff"]
+        if age >= LIVE_MAX_AGE:          # over by any measure -> never "live"
+            # no result yet = awaiting settle/recovery; the hub buckets a
+            # past-kickoff "upcoming" as "awaiting result", never as live.
+            return "upcoming"
+        if 0 <= age < LIVE_MAX_AGE and (m["is_live"] or age < 10 * 60):
+            return "live"
+        return "upcoming"
+
+    def _book(m):
+        """Real bookmaker decimal odds (vig included) from the stored ESPN
+        moneylines — the number Coinplay would actually pay. Kept separate
+        from `intel`, which is de-vigged (fair) % and overstates payouts."""
+        raw = m["odds_full"] if "odds_full" in m.keys() else None
+        if not raw:
+            return None
+        try:
+            o = json.loads(raw)
+            out = {}
+            for side, key in (("1", "h"), ("X", "d"), ("2", "a")):
+                ml = o.get(key)
+                if not isinstance(ml, int) or ml == 0:
+                    return None
+                dec = 1 + (ml / 100 if ml > 0 else 100 / abs(ml))
+                out[side] = round(dec, 3)
+            return out
+        except Exception:
+            return None
+
     return web.json_response([{
         "id": m["id"], "t1": m["t1"], "t2": m["t2"],
         "kickoff": m["kickoff"], "result": m["result"], "score": m["score"],
         "odds": m["odds"],
-        # hard cap: no football match runs 4 hours. A stale is_live flag
-        # (sync missed the final whistle) must never pin LIVE forever —
-        # past the cap the fixture hides until results arrive.
-        "status": "settled" if m["result"] else
-                  ("live" if ((m["is_live"] or m["kickoff"] <= now)
-                              and now - m["kickoff"] < 4 * HOUR)
-                   else "upcoming"),
+        "status": _status(m),
         "my_pick": (picks.get(m["id"]) or (None, None))[0],
         "my_score": (picks.get(m["id"]) or (None, None))[1],
         "split": dist.get(m["id"], {"1": 0, "X": 0, "2": 0}),
         "intel": implied_probs(m["odds_full"] if "odds_full" in m.keys() else None),
+        "book": _book(m),
         "form": {"t1": form.get(m["t1"], ""), "t2": form.get(m["t2"], "")},
     } for m in rows])
 
@@ -1424,11 +1577,16 @@ async def api_news(request):
 
 
 async def api_leaderboard(request):
+    me = api_uid(request)
     rows = await db.leaderboard(20)
     return web.json_response([{
         "rank": i + 1, "name": r["name"], "team": r["team"],
         "correct": r["correct"], "total": r["total"], "streak": r["streak"],
         "points": r["points"],
+        # the frontend marks "you" by id — name matching collides on shared
+        # first names (two "Александр") and breaks when the stored name differs
+        # from the Telegram WebApp first_name.
+        "is_me": (r["tg_id"] == me) if me else False,
     } for i, r in enumerate(rows)])
 
 
