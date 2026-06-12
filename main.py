@@ -46,7 +46,7 @@ ESPN_LEAGUE = os.getenv("ESPN_LEAGUE", "fifa.world")   # ESPN soccer league slug
 SYNC_LOOKAHEAD_DAYS = int(os.getenv("SYNC_LOOKAHEAD_DAYS", 30))
 ANNOUNCE_GAP = int(os.getenv("ANNOUNCE_GAP_HOURS", 6)) * 3600  # min gap between announce pushes per user
 SYNC_INTERVAL_MIN = int(os.getenv("SYNC_INTERVAL_MIN", 30))    # idle ESPN poll cadence
-LIVE_POLL_SEC = int(os.getenv("LIVE_POLL_SEC", 60))            # cadence while a match is in play
+LIVE_POLL_SEC = int(os.getenv("LIVE_POLL_SEC", 20))            # cadence while a match is in play
 VIP_PRICE_STARS = int(os.getenv("VIP_PRICE_STARS", 250))       # Telegram Stars / month
 VIP_CHANNEL_INVITE = os.getenv("VIP_CHANNEL_INVITE", "")       # private VIP channel invite link
 WC_END = os.getenv("WC_END", "2026-07-19")                     # real deadline = honest FOMO
@@ -393,6 +393,73 @@ async def addmatch(msg: Message):
         await msg.answer(f"Format: /addmatch Team1;Team2;YYYY-MM-DD HH:MM\n({e})")
 
 
+def _ml_prob(ml: int) -> float:
+    """American moneyline -> implied probability (with vig)."""
+    return abs(ml) / (abs(ml) + 100) if ml < 0 else 100 / (ml + 100)
+
+
+def implied_probs(odds_full: str | None):
+    """{'1': 54, 'X': 24, '2': 22} normalized de-vigged percentages,
+    or None. The market's opinion, not ours."""
+    if not odds_full:
+        return None
+    try:
+        o = json.loads(odds_full)
+        raw = {"1": _ml_prob(o["h"]), "X": _ml_prob(o["d"]),
+               "2": _ml_prob(o["a"])}
+    except Exception:
+        return None
+    total = sum(raw.values())
+    if total <= 0:
+        return None
+    out = {k: round(100 * v / total) for k, v in raw.items()}
+    # rounding drift -> pin to 100 on the largest bucket
+    drift = 100 - sum(out.values())
+    out[max(out, key=out.get)] += drift
+    return out
+
+
+def _parse_line(odds: str | None):
+    """'BRA -145' -> ('BRA', -145); None when not parseable."""
+    if not odds:
+        return None
+    mt = re.fullmatch(r"([A-Z]{2,4})\s*([+-]\d{2,4})", odds.strip())
+    return (mt.group(1), int(mt.group(2))) if mt else None
+
+
+def _code_matches(code: str, team: str) -> bool:
+    """FIFA code vs team name, subsequence match (KOR ⊂ 'South KORea').
+    Misses exotic codes (SUI) — then we simply skip the number rather
+    than invent one."""
+    t = "".join(ch for ch in team.upper() if ch.isalpha())
+    it = iter(t)
+    return all(ch in it for ch in code)
+
+
+def missed_profit(m, pick: str, stake: float = 20.0):
+    """Profit a correct pick would have returned at the stored real line.
+    Full three-way odds when ESPN gave them; otherwise only when the quoted
+    team is the picked team — anything else would be a made-up number."""
+    try:
+        if m["odds_full"]:
+            o = json.loads(m["odds_full"])
+            ml = {"1": o["h"], "X": o["d"], "2": o["a"]}[pick]
+            profit = stake * (ml / 100 if ml > 0 else 100 / abs(ml))
+            return round(profit, 1)
+    except Exception:
+        pass
+    parsed = _parse_line(m["odds"])
+    if not parsed or pick not in ("1", "2"):
+        return None
+    code, line = parsed
+    side = "1" if _code_matches(code, m["t1"]) else (
+        "2" if _code_matches(code, m["t2"]) else None)
+    if side != pick:
+        return None
+    profit = stake * (line / 100 if line > 0 else 100 / abs(line))
+    return round(profit, 1)
+
+
 async def do_settle(mid: int, result: str, score: str) -> int:
     """Score predictions, push results, fire bridge triggers. Returns count.
     Returns -1 if the match was already settled (nothing re-scored)."""
@@ -402,13 +469,32 @@ async def do_settle(mid: int, result: str, score: str) -> int:
     if m["result"]:                  # idempotent: never double-count stats
         return -1
     rows = await db.settle_match(mid, result, score)
-    for uid, ok in rows:
+    for uid, ok, exact in rows:
         u = await db.get_user(uid)
         if ok:
             kb = kb_bridge(uid, T.BTN_CASH_READ) if not u["registered"] else None
-            await safe_send(uid, T.RESULT_WIN.format(
-                t1=m["t1"], t2=m["t2"], score=score,
-                points=10, streak=u["streak"]), reply_markup=kb)
+            text = (T.RESULT_EXACT.format(t1=m["t1"], t2=m["t2"], score=score,
+                                          streak=u["streak"])
+                    if exact else
+                    T.RESULT_WIN.format(t1=m["t1"], t2=m["t2"], score=score,
+                                        points=10, streak=u["streak"]))
+            # the missed-winnings receipt: their own read, the real line,
+            # an exact number they did not collect. Compounds every win.
+            if not u["registered"]:
+                amt = missed_profit(m, result)
+                if amt:
+                    total = await db.add_missed(uid, amt)
+                    text += "\n\n" + T.MISSED_RECEIPT.format(
+                        amt=amt, total=round(total))
+            await safe_send(uid, text, reply_markup=kb)
+            # milestone: the 3rd correct call of the week crosses exactly
+            # once per week — peak proof-of-skill moment for the bridge
+            if not u["registered"] and u["week_correct"] == 3:
+                await fire_bridge(uid, T.TRIGGER_SHARP.format(
+                    correct=u["week_correct"], total=u["week_total"],
+                    missed=round(u["missed_usdt"] or 0)
+                    if "missed_usdt" in u.keys() else 0),
+                    T.BRIDGE_BUTTON)
             if u["streak"] >= 3 and not u["registered"]:
                 await fire_bridge(uid, T.TRIGGER_STREAK.format(
                     name=u["name"], streak=u["streak"]), T.BRIDGE_BUTTON,
@@ -681,9 +767,20 @@ async def _sync_fixtures_inner() -> dict:
                 ev["date"].replace("Z", "+00:00")).timestamp())
             mid = await db.upsert_match_ext(str(ev["id"]), t1, t2, kickoff)
             upserted += 1
-            odds = (comp.get("odds") or [{}])[0].get("details")
+            odds_obj = (comp.get("odds") or [{}])[0]
+            odds = odds_obj.get("details")
             if odds:                                # real ESPN line, when given
                 await db.set_match_odds(mid, str(odds)[:32])
+            try:
+                full = {
+                    "h": (odds_obj.get("homeTeamOdds") or {}).get("moneyLine"),
+                    "a": (odds_obj.get("awayTeamOdds") or {}).get("moneyLine"),
+                    "d": (odds_obj.get("drawOdds") or {}).get("moneyLine"),
+                }
+                if all(isinstance(v, int) for v in full.values()):
+                    await db.set_match_odds_full(mid, json.dumps(full))
+            except Exception:
+                pass
             state = ev.get("status", {}).get("type", {}).get("state", "pre")
             tname = ev.get("status", {}).get("type", {}).get("name", "")
             completed = bool(ev.get("status", {}).get("type", {})
@@ -756,8 +853,59 @@ async def _sync_fixtures_inner() -> dict:
         await db.set_match_live(m["id"], m["score"] or "", live=0)
         log.warning("cleared stale live flag: match %s (%s vs %s)",
                     m["id"], m["t1"], m["t2"])
+
+    # recovery: matches that ended but never settled (bot restart at the
+    # final whistle, event slipped out of the scoreboard window). Picks on
+    # them sit in limbo and nobody's points move — fetch the event summary
+    # directly by id and settle from it.
+    overdue = await db.matches_where(
+        "result IS NULL AND ext_id IS NOT NULL AND kickoff < ?",
+        (int(time.time()) - 3 * HOUR,))
+    recovered = 0
+    for m in overdue[:10]:                     # cap per sync run
+        if await recover_match_result(m):
+            recovered += 1
     return {"fixtures": upserted, "settled": settled,
-            "stale_cleared": len(stale)}
+            "stale_cleared": len(stale), "recovered": recovered}
+
+
+async def recover_match_result(m) -> bool:
+    """Settle one overdue match from ESPN's per-event summary endpoint."""
+    url = (f"https://site.api.espn.com/apis/site/v2/sports/soccer/"
+           f"{ESPN_LEAGUE}/summary")
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, params={"event": m["ext_id"]},
+                             timeout=15) as resp:
+                if resp.status != 200:
+                    return False
+                data = await resp.json()
+    except Exception as e:
+        log.warning("summary fetch failed for %s: %s", m["ext_id"], e)
+        return False
+    try:
+        comp = (data.get("header", {}).get("competitions") or [{}])[0]
+        st = comp.get("status", {}).get("type", {})
+        if not st.get("completed"):
+            return False
+        home = next(c for c in comp["competitors"]
+                    if c.get("homeAway") == "home")
+        away = next(c for c in comp["competitors"]
+                    if c.get("homeAway") == "away")
+        hs, as_ = int(home.get("score", 0)), int(away.get("score", 0))
+        res = "1" if hs > as_ else ("2" if as_ > hs else "X")
+        if home.get("winner"):
+            res = "1"
+        elif away.get("winner"):
+            res = "2"
+        await db.set_match_live(m["id"], f"{hs}:{as_}", live=0)
+        await do_settle(m["id"], res, f"{hs}:{as_}")
+        log.info("recovered + settled overdue match %s (%s:%s)",
+                 m["id"], hs, as_)
+        return True
+    except Exception:
+        log.exception("bad summary payload for %s", m["ext_id"])
+        return False
 
 
 @r.message(Command("sync"))
@@ -843,6 +991,23 @@ async def scheduler():
                     await sync_fixtures()
                     await db.meta_set("last_sync", str(now))
                 else:
+                    # personal analyst recap: their numbers vs the crowd's,
+                    # plus the week's unclaimed-profit slice. All computed.
+                    cw, ct = await db.week_crowd_accuracy()
+                    crowd_pct = round(100 * cw / ct) if ct else 0
+                    for u in await db.all_users(
+                            "week_total > 0 AND blocked=0"):
+                        my_pct = round(100 * u["week_correct"] / u["week_total"])
+                        txt = T.WEEKLY_RECAP.format(
+                            correct=u["week_correct"], total=u["week_total"],
+                            my_pct=my_pct, crowd_pct=crowd_pct)
+                        wm = u["week_missed"] if "week_missed" in u.keys() else 0
+                        if not u["registered"] and wm and wm > 0:
+                            txt += "\n" + T.WEEKLY_RECAP_MISSED.format(
+                                missed=round(wm))
+                        await safe_send(u["tg_id"], txt)
+                        await asyncio.sleep(0.05)
+
                     top = await db.weekly_top(10)
                     if top:
                         podium = "\n".join(
@@ -904,6 +1069,31 @@ async def scheduler():
                             calls="call" if gap == 1 else "calls"))
                         await asyncio.sleep(0.05)
                 await db.meta_set("proximity_week", str(week_start))
+
+            # 0a-pre) T-60: one hour before each real kickoff, pickers get
+            # their call back in front of them with the market's number.
+            # The flag is per-match and race-safe, so this fires exactly once.
+            t60 = await db.matches_where(
+                "result IS NULL AND t60_done=0 AND kickoff > ? AND kickoff <= ?",
+                (now + 50 * 60, now + 70 * 60))
+            for m in t60:
+                if not await db.mark_t60(m["id"]):
+                    continue
+                probs = implied_probs(
+                    m["odds_full"] if "odds_full" in m.keys() else None)
+                for p in await db.picks_for_match(m["id"]):
+                    u = await db.get_user(p["user_id"])
+                    if not u or u["blocked"]:
+                        continue
+                    side = {"1": m["t1"], "X": "Draw", "2": m["t2"]}[p["pick"]]
+                    mkt = (T.T60_MARKET_LINE.format(pct=probs[p["pick"]])
+                           if probs else "")
+                    kb = (kb_webapp(T.BTN_HUB_TRACK) if u["registered"]
+                          else kb_bridge(p["user_id"], T.BTN_CASH_READ))
+                    await safe_send(p["user_id"], T.T60_PUSH.format(
+                        t1=m["t1"], t2=m["t2"], side=side, market=mkt),
+                        reply_markup=kb)
+                    await asyncio.sleep(0.05)
 
             # 0a) idle fixtures sync (refreshes the schedule, catches results
             # missed while nothing was live). Live-cadence polling — goal
@@ -1093,6 +1283,7 @@ async def api_me(request):
         "name": u["name"], "team": u["team"],
         "correct": u["correct"], "total": u["total"], "streak": u["streak"],
         "pending": await db.pending_picks(uid),
+        "missed_usdt": round(u["missed_usdt"] or 0) if "missed_usdt" in u.keys() else 0,
         "week_correct": u["week_correct"], "week_total": u["week_total"],
         "accuracy": round(100 * u["correct"] / u["total"]) if u["total"] else None,
         "registered": bool(u["registered"]),
@@ -1101,7 +1292,9 @@ async def api_me(request):
 
 async def api_matches(request):
     uid = api_uid(request)
-    picks = await db.user_picks(uid) if uid else {}
+    picks = await db.user_pick_details(uid) if uid else {}
+    dist = await db.pick_distribution()
+    form = await db.all_team_form()
     now = int(time.time())
     rows = await db.matches_where(
         "kickoff > ? OR result IS NOT NULL", (now - 2 * DAY,))
@@ -1116,7 +1309,11 @@ async def api_matches(request):
                   ("live" if ((m["is_live"] or m["kickoff"] <= now)
                               and now - m["kickoff"] < 4 * HOUR)
                    else "upcoming"),
-        "my_pick": picks.get(m["id"]),
+        "my_pick": (picks.get(m["id"]) or (None, None))[0],
+        "my_score": (picks.get(m["id"]) or (None, None))[1],
+        "split": dist.get(m["id"], {"1": 0, "X": 0, "2": 0}),
+        "intel": implied_probs(m["odds_full"] if "odds_full" in m.keys() else None),
+        "form": {"t1": form.get(m["t1"], ""), "t2": form.get(m["t2"], "")},
     } for m in rows])
 
 
@@ -1126,11 +1323,22 @@ async def api_predict(request):
         return web.json_response({"error": "unauthorized"}, status=401)
     body = await request.json()
     mid, pick = int(body.get("match_id", 0)), body.get("pick")
+    score_pick = body.get("score")
     m = await db.get_match(mid)
     if not m or m["result"] or m["kickoff"] <= int(time.time()) \
             or pick not in ("1", "X", "2"):
         return web.json_response({"error": "match closed"}, status=400)
-    first = await db.save_prediction(uid, mid, pick)
+    if score_pick is not None:
+        # exact score is optional sugar: must parse and agree with the
+        # outcome pick, otherwise it silently drops to outcome-only
+        mt = re.fullmatch(r"(\d{1,2}):(\d{1,2})", str(score_pick))
+        if mt:
+            h, a = int(mt.group(1)), int(mt.group(2))
+            outcome = "1" if h > a else ("2" if a > h else "X")
+            score_pick = f"{h}:{a}" if outcome == pick else None
+        else:
+            score_pick = None
+    first = await db.save_prediction(uid, mid, pick, score_pick)
     # the funnel must not fork: a first pick made in the mini app gets the
     # same verification ask as an in-bot pick — otherwise the whole web-app
     # path silently skips phone/email capture
@@ -1149,6 +1357,65 @@ async def api_predict(request):
             await safe_send(uid, ask, reply_markup=kb_contact(),
                             disable_web_page_preview=True)
     return web.json_response({"ok": True, "first_prediction": first})
+
+
+async def api_feed(request):
+    """The pulse: real picks, real results, real streaks. No actors —
+    fabricated winners are an FTC/EU-consumer-law problem and a trust
+    killer; the live league generates plenty of genuine signal."""
+    return web.json_response(await db.feed_events(40))
+
+
+_news_cache: dict = {"ts": 0, "items": []}
+NEWS_FEEDS = [
+    "https://feeds.bbci.co.uk/sport/football/rss.xml",
+    "https://www.espn.com/espn/rss/soccer/news",
+]
+
+
+async def api_news(request):
+    """Aggregated football RSS, cached 10 min server-side."""
+    now = int(time.time())
+    if now - _news_cache["ts"] > 600:
+        items = []
+        import xml.etree.ElementTree as ET
+        for feed in NEWS_FEEDS:
+            try:
+                async with aiohttp.ClientSession() as sess:
+                    async with sess.get(feed, timeout=10) as resp:
+                        if resp.status != 200:
+                            continue
+                        raw = await resp.text()
+                root = ET.fromstring(raw)
+                for it in root.iter("item"):
+                    title = (it.findtext("title") or "").strip()
+                    link = (it.findtext("link") or "").strip()
+                    pub = (it.findtext("pubDate") or "").strip()
+                    if not title or not link:
+                        continue
+                    ts = 0
+                    try:
+                        from email.utils import parsedate_to_datetime
+                        ts = int(parsedate_to_datetime(pub).timestamp())
+                    except Exception:
+                        pass
+                    items.append({"title": title[:200], "link": link,
+                                  "ts": ts,
+                                  "src": "BBC" if "bbci" in feed else "ESPN"})
+            except Exception as e:
+                log.warning("news feed failed (%s): %s", feed, e)
+        items.sort(key=lambda x: x["ts"], reverse=True)
+        # dedupe near-identical titles across feeds
+        seen, deduped = set(), []
+        for it in items:
+            key = it["title"].lower()[:60]
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(it)
+        _news_cache["items"] = deduped[:20]
+        _news_cache["ts"] = now
+    return web.json_response(_news_cache["items"])
 
 
 async def api_leaderboard(request):
@@ -1211,6 +1478,8 @@ async def run_web():
     app.router.add_get("/api/matches", api_matches)
     app.router.add_post("/api/predict", api_predict)
     app.router.add_get("/api/leaderboard", api_leaderboard)
+    app.router.add_get("/api/feed", api_feed)
+    app.router.add_get("/api/news", api_news)
     app.router.add_route("OPTIONS", "/{tail:.*}", lambda r: web.Response())
     runner = web.AppRunner(app)
     await runner.setup()

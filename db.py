@@ -81,7 +81,10 @@ async def init():
                          ("registered_at", "INTEGER DEFAULT 0"),
                          ("dep_cascade_step", "INTEGER DEFAULT 0"),
                          ("vip", "INTEGER DEFAULT 0"),
-                         ("vip_until", "INTEGER DEFAULT 0")]:
+                         ("vip_until", "INTEGER DEFAULT 0"),
+                         ("week_bonus", "INTEGER DEFAULT 0"),
+                         ("missed_usdt", "REAL DEFAULT 0"),
+                         ("week_missed", "REAL DEFAULT 0")]:
             try:
                 await db.execute(f"ALTER TABLE users ADD COLUMN {col} {ddl}")
             except Exception:
@@ -102,6 +105,31 @@ async def init():
         try:
             await db.execute(
                 "ALTER TABLE predictions ADD COLUMN alerted INTEGER DEFAULT 0")
+        except Exception:
+            pass
+        try:
+            await db.execute(
+                "ALTER TABLE predictions ADD COLUMN score_pick TEXT")
+        except Exception:
+            pass
+        try:
+            await db.execute(
+                "ALTER TABLE predictions ADD COLUMN created_at "
+                "INTEGER DEFAULT 0")
+        except Exception:
+            pass
+        try:
+            await db.execute(
+                "ALTER TABLE matches ADD COLUMN settled_at INTEGER DEFAULT 0")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE matches ADD COLUMN odds_full TEXT")
+        except Exception:
+            pass
+        try:
+            await db.execute(
+                "ALTER TABLE matches ADD COLUMN t60_done INTEGER DEFAULT 0")
         except Exception:
             pass
         await db.commit()
@@ -148,13 +176,14 @@ async def user_rank(uid: int):
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
             "SELECT week_correct + COALESCE(ref_week_points,0) "
-            "FROM users WHERE tg_id=?", (uid,))
+            "+ COALESCE(week_bonus,0) FROM users WHERE tg_id=?", (uid,))
         row = await cur.fetchone()
         if not row:
             return None
         cur = await db.execute(
             "SELECT COUNT(*)+1 FROM users WHERE week_total>0 "
-            "AND week_correct + COALESCE(ref_week_points,0) > ?",
+            "AND week_correct + COALESCE(ref_week_points,0) "
+            "+ COALESCE(week_bonus,0) > ?",
             (row[0],))
         (rank,) = await cur.fetchone()
         return rank
@@ -222,7 +251,8 @@ async def mark_announced(mid: int):
         await db.commit()
 
 
-async def save_prediction(uid: int, mid: int, pick: str) -> bool:
+async def save_prediction(uid: int, mid: int, pick: str,
+                          score_pick: str | None = None) -> bool:
     """Returns True if it was the user's FIRST ever prediction."""
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
@@ -231,9 +261,17 @@ async def save_prediction(uid: int, mid: int, pick: str) -> bool:
         # NOT "INSERT OR REPLACE": REPLACE = delete+insert, which silently
         # resets `alerted` (re-arms goal pings) and wipes `correct`.
         await db.execute(
-            "INSERT INTO predictions (user_id,match_id,pick) VALUES (?,?,?) "
+            "INSERT INTO predictions (user_id,match_id,pick,score_pick,"
+            "created_at) VALUES (?,?,?,?,?) "
             "ON CONFLICT(user_id,match_id) DO UPDATE SET "
-            "pick=excluded.pick, correct=NULL", (uid, mid, pick))
+            "pick=excluded.pick, "
+            # same outcome + no new score => keep the existing exact score;
+            # outcome changed => old score is inconsistent, drop/replace it
+            "score_pick=CASE WHEN predictions.pick=excluded.pick "
+            "AND excluded.score_pick IS NULL THEN predictions.score_pick "
+            "ELSE excluded.score_pick END, "
+            "correct=NULL",
+            (uid, mid, pick, score_pick, int(time.time())))
         await db.execute(
             "UPDATE users SET last_pick_at=?, rehooked=0 WHERE tg_id=?",
             (int(time.time()), uid))
@@ -247,6 +285,52 @@ async def set_match_live(mid: int, score: str, live: int = 1):
         await db.execute("UPDATE matches SET score=?, is_live=? WHERE id=?",
                          (score, live, mid))
         await db.commit()
+
+
+async def set_match_odds_full(mid: int, odds_json: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE matches SET odds_full=? WHERE id=?",
+                         (odds_json, mid))
+        await db.commit()
+
+
+async def mark_t60(mid: int) -> bool:
+    """Set the T-60 flag; True only for the first caller (race-safe)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "UPDATE matches SET t60_done=1 WHERE id=? AND t60_done=0", (mid,))
+        await db.commit()
+        return cur.rowcount > 0
+
+
+async def all_team_form(max_n: int = 3):
+    """team name -> 'WDL' string (most recent first), built ONLY from
+    settled matches in this tournament. Real results, nothing narrated."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT t1, t2, result FROM matches "
+            "WHERE result IN ('1','X','2') "
+            "ORDER BY settled_at DESC, id DESC")
+        form: dict = {}
+        for r in await cur.fetchall():
+            for team, mine in ((r["t1"], "1"), (r["t2"], "2")):
+                if len(form.get(team, "")) >= max_n:
+                    continue
+                letter = "D" if r["result"] == "X" else (
+                    "W" if r["result"] == mine else "L")
+                form[team] = form.get(team, "") + letter
+        return form
+
+
+async def week_crowd_accuracy():
+    """(correct, total) across all users this week — the benchmark line
+    in the personal recap."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT COALESCE(SUM(week_correct),0), "
+            "COALESCE(SUM(week_total),0) FROM users")
+        return await cur.fetchone()
 
 
 async def set_match_odds(mid: int, odds: str):
@@ -297,8 +381,9 @@ async def settle_match(mid: int, result: str, score: str):
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
-            "UPDATE matches SET result=?, score=? WHERE id=? AND result IS NULL",
-            (result, score, mid))
+            "UPDATE matches SET result=?, score=?, settled_at=? "
+            "WHERE id=? AND result IS NULL",
+            (result, score, int(time.time()), mid))
         if cur.rowcount == 0:        # already settled (or voided)
             await db.commit()
             return []
@@ -308,6 +393,11 @@ async def settle_match(mid: int, result: str, score: str):
         out = []
         for p in preds:
             ok = 1 if p["pick"] == result else 0
+            # exact-score jackpot: +2 league points on top of the outcome
+            # point. Only possible when the outcome is right too, so the
+            # combo is worth 3 points total.
+            exact = 1 if (ok and p["score_pick"]
+                          and p["score_pick"] == score) else 0
             await db.execute(
                 "UPDATE predictions SET correct=? WHERE user_id=? AND match_id=?",
                 (ok, p["user_id"], mid))
@@ -315,13 +405,14 @@ async def settle_match(mid: int, result: str, score: str):
                 await db.execute(
                     "UPDATE users SET streak=streak+1, correct=correct+1, "
                     "total=total+1, week_correct=week_correct+1, "
-                    "week_total=week_total+1 WHERE tg_id=?", (p["user_id"],))
+                    "week_total=week_total+1, week_bonus=week_bonus+? "
+                    "WHERE tg_id=?", (2 if exact else 0, p["user_id"]))
             else:
                 await db.execute(
                     "UPDATE users SET streak=0, total=total+1, "
                     "week_total=week_total+1 WHERE tg_id=?",
                     (p["user_id"],))
-            out.append((p["user_id"], ok))
+            out.append((p["user_id"], ok, exact))
         await db.commit()
         return out
 
@@ -341,7 +432,8 @@ async def leaderboard(limit: int = 20):
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
             "SELECT name, team, week_correct AS correct, week_total AS total, "
-            "streak, week_correct + COALESCE(ref_week_points,0) AS points "
+            "streak, week_correct + COALESCE(ref_week_points,0) "
+            "+ COALESCE(week_bonus,0) AS points "
             "FROM users WHERE week_total > 0 OR last_pick_at > 0 "
             "ORDER BY points DESC, week_total ASC, last_pick_at DESC "
             "LIMIT ?", (limit,))
@@ -353,7 +445,8 @@ async def weekly_top(limit: int = 10):
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
             "SELECT tg_id, name, week_correct, week_total, "
-            "week_correct + COALESCE(ref_week_points,0) AS points "
+            "week_correct + COALESCE(ref_week_points,0) "
+            "+ COALESCE(week_bonus,0) AS points "
             "FROM users WHERE week_total > 0 "
             "ORDER BY points DESC, week_total ASC LIMIT ?", (limit,))
         return await cur.fetchall()
@@ -362,7 +455,7 @@ async def weekly_top(limit: int = 10):
 async def weekly_reset():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("UPDATE users SET week_correct=0, week_total=0, "
-                         "ref_week_points=0")
+                         "ref_week_points=0, week_bonus=0, week_missed=0")
         await db.commit()
 
 
@@ -409,6 +502,89 @@ async def user_picks(uid: int):
         cur = await db.execute(
             "SELECT match_id, pick FROM predictions WHERE user_id=?", (uid,))
         return {mid: pick for mid, pick in await cur.fetchall()}
+
+
+async def user_pick_details(uid: int):
+    """match_id -> (pick, score_pick) for the mini-app."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT match_id, pick, score_pick FROM predictions "
+            "WHERE user_id=?", (uid,))
+        return {mid: (pick, sp) for mid, pick, sp in await cur.fetchall()}
+
+
+async def add_missed(uid: int, amount: float) -> float:
+    """Accumulate the receipt of unclaimed profit (correct reads priced at
+    the real pre-match line, 20 USDT reference stake). Returns new total."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET missed_usdt = COALESCE(missed_usdt,0) + ?, "
+            "week_missed = COALESCE(week_missed,0) + ? "
+            "WHERE tg_id=?", (amount, amount, uid))
+        await db.commit()
+        cur = await db.execute(
+            "SELECT COALESCE(missed_usdt,0) FROM users WHERE tg_id=?", (uid,))
+        return (await cur.fetchone())[0]
+
+
+async def pick_distribution():
+    """match_id -> {"1": n, "X": n, "2": n} — the real crowd, no actors."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT match_id, pick, COUNT(*) FROM predictions "
+            "GROUP BY match_id, pick")
+        out = {}
+        for mid, pick, n in await cur.fetchall():
+            out.setdefault(mid, {"1": 0, "X": 0, "2": 0})[pick] = n
+        return out
+
+
+async def feed_events(limit: int = 40):
+    """Real activity for the pulse feed: actual picks, exact-score locks,
+    settled matches with real winner counts, live streaks. Nothing invented."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        items = []
+        cur = await db.execute(
+            "SELECT p.created_at AS ts, u.name, m.t1, m.t2, m.kickoff, "
+            "p.pick, p.score_pick FROM predictions p "
+            "JOIN users u ON u.tg_id = p.user_id "
+            "JOIN matches m ON m.id = p.match_id "
+            "WHERE p.created_at > 0 ORDER BY p.created_at DESC LIMIT ?",
+            (limit,))
+        now = int(time.time())
+        for r in await cur.fetchall():
+            # the side stays sealed until kickoff — otherwise the league
+            # turns into "copy whoever leads the table"
+            sealed = r["kickoff"] > now
+            items.append({"type": "pick", "ts": r["ts"], "name": r["name"],
+                          "t1": r["t1"], "t2": r["t2"],
+                          "pick": None if sealed else r["pick"],
+                          "score_pick": None if sealed else r["score_pick"],
+                          "sealed": sealed})
+        cur = await db.execute(
+            "SELECT m.settled_at AS ts, m.t1, m.t2, m.score, m.result, "
+            "SUM(CASE WHEN p.correct=1 THEN 1 ELSE 0 END) AS winners, "
+            "SUM(CASE WHEN p.correct=1 AND p.score_pick=m.score "
+            "THEN 1 ELSE 0 END) AS exact, COUNT(p.user_id) AS total "
+            "FROM matches m LEFT JOIN predictions p ON p.match_id = m.id "
+            "WHERE m.settled_at > 0 AND m.result IS NOT NULL "
+            "AND m.result != 'V' "
+            "GROUP BY m.id ORDER BY m.settled_at DESC LIMIT 10")
+        for r in await cur.fetchall():
+            items.append({"type": "settled", "ts": r["ts"], "t1": r["t1"],
+                          "t2": r["t2"], "score": r["score"],
+                          "winners": r["winners"] or 0,
+                          "exact": r["exact"] or 0,
+                          "total": r["total"] or 0})
+        cur = await db.execute(
+            "SELECT name, streak FROM users WHERE streak >= 3 "
+            "ORDER BY streak DESC LIMIT 5")
+        for r in await cur.fetchall():
+            items.append({"type": "streak", "ts": 0, "name": r["name"],
+                          "streak": r["streak"]})
+        items.sort(key=lambda x: x["ts"], reverse=True)
+        return items[:limit]
 
 
 async def pending_picks(uid: int) -> int:

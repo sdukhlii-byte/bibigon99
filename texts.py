@@ -123,6 +123,48 @@ MYSTATS = (
 )
 MYSTATS_EMPTY = "No picks yet — your card is empty. Fix that: /schedule"
 
+MISSED_RECEIPT = (
+    "💸 At the real pre-match line, that read = <b>+{amt} USDT</b> "
+    "on a 20 USDT stake.\n"
+    "Your unclaimed total this World Cup: <b>{total} USDT</b> — "
+    "calls you already made, money you never collected."
+)
+
+T60_PUSH = (
+    "⏱ <b>{t1} vs {t2} kicks off in 1 hour.</b>\n\n"
+    "Your call: <b>{side}</b>.{market}\n"
+    "The pre-match window closes at the whistle — after that the line is gone."
+)
+
+T60_MARKET_LINE = " The market prices it at <b>{pct}%</b>."
+
+WEEKLY_RECAP = (
+    "📊 <b>Your week in numbers</b>\n\n"
+    "Calls: <b>{correct}/{total}</b> — that's <b>{my_pct}%</b> accuracy.\n"
+    "The crowd this week: {crowd_pct}%.\n\n"
+    "New week starts now. Same eyes, fresh card: /schedule"
+)
+
+WEEKLY_RECAP_MISSED = (
+    "💸 Your correct reads were worth <b>{missed} USDT</b> at the real "
+    "lines this week — none of it collected."
+)
+
+TRIGGER_SHARP = (
+    "🎯 <b>Third correct call of the week — {correct}/{total}.</b>\n\n"
+    "That's not luck anymore, that's a read. Your unclaimed tally at the "
+    "real lines: <b>{missed} USDT</b>.\n\n"
+    "One question: how long do you keep doing this for free?"
+)
+
+RESULT_EXACT = (
+    "💎 <b>EXACT SCORE. {t1} — {t2}: {score}.</b>\n\n"
+    "You didn't just call the winner — you called the scoreline. "
+    "That's <b>+3 league points</b> (1 for the result, +2 jackpot) "
+    "and a {streak}-streak 🔥\n\n"
+    "Reads this sharp are worth real odds, not just bragging rights."
+)
+
 MYSTATS_PENDING = (
     "📊 <b>Your league card</b>\n\n"
     "{pending} pick(s) locked in, waiting for full time ⏳\n"
