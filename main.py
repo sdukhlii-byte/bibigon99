@@ -37,6 +37,11 @@ ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
 PRELANDING_URL = os.getenv("PRELANDING_URL", "https://example.com")
 TRACKER_URL = os.getenv("TRACKER_URL", "")   # Keitaro campaign URL; if set, bridge goes through it
 WEBAPP_URL = os.getenv("WEBAPP_URL", PRELANDING_URL)
+# Telegram WebView caches the mini-app per-URL, hard. Bump WEBAPP_V
+# (any string) after a frontend deploy and every client refetches.
+WEBAPP_V = os.getenv("WEBAPP_V", "")
+if WEBAPP_V and WEBAPP_URL:
+    WEBAPP_URL += ("&" if "?" in WEBAPP_URL else "?") + f"v={WEBAPP_V}"
 POSTBACK_SECRET = os.getenv("POSTBACK_SECRET", "change-me")
 META_PIXEL_ID = os.getenv("META_PIXEL_ID", "")        # Meta CAPI: server-side events
 META_CAPI_TOKEN = os.getenv("META_CAPI_TOKEN", "")
