@@ -200,9 +200,8 @@ TRIGGER_STREAK = (
     "{name}, <b>{streak} out of {streak}</b> 🔥 That's not luck anymore — that's a read.\n\n"
     "Honest question: you just called {streak} results in a row <i>for free</i>. "
     "What would that be worth if those picks weren't for points?\n\n"
-    "League players get a welcome package: your first deposit plays as <b>×2.25</b> "
-    "(drop 100 USDT — play with 225, up to 5,000) + <b>80 free spins</b> + "
-    "<b>cashback on your first bets</b>.\n\n"
+    "League players get a welcome package: your first deposit plays as <b>×2</b> "
+    "(drop 100 USDT — play with 200, 100% match up to 5,000) + <b>80 free spins</b>.\n\n"
     "Your read + double the bankroll. Run your own numbers 👇"
 )
 
@@ -228,7 +227,7 @@ MATCHDAY_BUTTON = "⚡ Claim before kickoff"
 # ---------- FLOOR 5: cascade (clicked bridge, no registration) ----------
 
 CASCADE_2H = (
-    "Your ×2.25 calculation is still sitting there 👀\n\n"
+    "Your ×2 calculation is still sitting there 👀\n\n"
     "One thing worth repeating: <b>cashback kicks in from your very first bet</b> — "
     "even if a pick doesn't land, part of it comes back. This isn't coin-flip "
     "gambling, it's playing with a safety net."
@@ -247,13 +246,13 @@ CASCADE_24H_EARLY = (
     "You're sitting at <b>{accuracy}% accuracy</b> — calling results for free "
     "that others get paid for.\n\n"
     "The welcome package turns the exact same reads into real numbers: "
-    "×2.25 on the first deposit + cashback either way. That math should interest you."
+    "×2 on the first deposit + cashback either way. That math should interest you."
 )
 
 CASCADE_5D = (
     "Okay {name}, no hype, just numbers.\n\n"
     "Minimum entry: <b>20 USDT</b>. That's a pizza.\n"
-    "With the bonus it becomes <b>45 in play + 80 free spins + cashback</b>.\n\n"
+    "With the bonus it becomes <b>40 in play + 80 free spins + cashback</b>.\n\n"
     "It's a small test, not a life decision. Worst case, the safety net catches part of it."
 )
 
@@ -269,7 +268,7 @@ CASCADE_7D = (
 REG_CONGRATS = (
     "Account created, bonus locked to it ✅\n\n"
     "It activates with your first deposit — from <b>20 USDT</b>. The stack: "
-    "<b>×2.25 on your bankroll + 80 free spins + cashback safety net</b>.\n\n"
+    "<b>×2 on your bankroll + 80 free spins + cashback safety net</b>.\n\n"
     "{team} play soon — get it done before kickoff."
 )
 
@@ -277,7 +276,7 @@ REG_CONGRATS = (
 REG_CONGRATS_MATCH = (
     "Account created, bonus locked to it ✅\n\n"
     "It activates with your first deposit — from <b>20 USDT</b>. The stack: "
-    "<b>×2.25 on your bankroll + 80 free spins + cashback safety net</b>.\n\n"
+    "<b>×2 on your bankroll + 80 free spins + cashback safety net</b>.\n\n"
     "<b>{team} kick off in {hours}h</b> — get it done before the whistle."
 )
 
@@ -285,12 +284,12 @@ REG_CONGRATS_MATCH = (
 REG_CONGRATS_GENERIC = (
     "Account created, bonus locked to it ✅\n\n"
     "It activates with your first deposit — from <b>20 USDT</b>. The stack: "
-    "<b>×2.25 on your bankroll + 80 free spins + cashback safety net</b>.\n\n"
+    "<b>×2 on your bankroll + 80 free spins + cashback safety net</b>.\n\n"
     "Matches run every day — next one: /schedule. Lock it in before the odds move."
 )
 
 DEP_CONGRATS = (
-    "Bonus activated 🔥 Your bankroll just played <b>×2.25</b>, free spins "
+    "Bonus activated 🔥 Your bankroll just played <b>×2</b>, free spins "
     "are loading, cashback is armed.\n\n"
     "Your league picks now have real weight behind them. Same reads — "
     "different stakes. Good luck out there 🎯"
@@ -324,7 +323,7 @@ WC_COUNTDOWN = (
 FOMO_RECEIPT = (
     "{name}, your week in one line:\n\n"
     "<b>{n} results called correctly.</b> For free.\n\n"
-    "Same reads with the ×2.25 stack behind them = working capital, "
+    "Same reads with the ×2 stack behind them = working capital, "
     "not trivia points. The league resets tomorrow — next week, "
     "same brain, real weight?"
 )
@@ -332,7 +331,7 @@ FOMO_RECEIPT = (
 DEP_CASCADE_20H = (
     "{name}, your bonus is sitting there fully loaded — and unused 🔋\n\n"
     "The math, one more time: <b>20 USDT in → 45 USDT to play with</b> "
-    "(×2.25), plus 80 free spins, plus cashback if the week goes sideways.\n\n"
+    "(×2), plus 80 free spins, plus cashback if the week goes sideways.\n\n"
     "You already did the hard part (the account). This part takes 2 minutes."
 )
 
@@ -340,7 +339,7 @@ DEP_CASCADE_68H = (
     "Last note about the bonus, {name} — then I drop it 🤝\n\n"
     "{team} keep playing either way. The only question is whether your "
     "reads keep being free entertainment or start carrying weight.\n\n"
-    "<b>×2.25 + 80 spins + cashback</b> — active the moment your first "
+    "<b>×2 + 80 spins + cashback</b> — active the moment your first "
     "deposit lands. After that, I'll only talk football."
 )
 
@@ -392,7 +391,7 @@ VIP_WELCOME = (
     "See you inside."
 )
 
-BTN_CASH_READ = "💸 Reads like this pay — claim ×2.25"
+BTN_CASH_READ = "💸 Reads like this pay — claim ×2"
 BTN_INVITE_SHARE = "📨 Share your link"
 
 INVITE = (
@@ -453,3 +452,23 @@ HUB_AFTER_VERIFY = (
 BTN_PICK_1 = "1️⃣ {t1}"
 BTN_PICK_X = "🤝 Draw"
 BTN_PICK_2 = "2️⃣ {t2}"
+
+# --- Coinplay betting guide (shown via /howto and the "How to bet" button) ---
+BTN_HOWTO = "📖 How to place the bet"
+BTN_GUIDE_OPEN = "🎯 Open Coinplay & bet"
+
+GUIDE_HEADER_PICK = (
+    "🎯 <b>Back your call on Coinplay</b>\n\n"
+    "Your read: <b>{t1} vs {t2}</b> → <b>{coin_side}</b>\n"
+    "On Coinplay that's the market <b>{market}</b>.\n\n"
+)
+GUIDE_HEADER_GENERIC = "🎯 <b>How to place your bet on Coinplay</b>\n\n"
+
+GUIDE_STEPS = (
+    "<b>1.</b> Tap <b>Continue with Telegram</b> — account in one tap, no email or password.\n\n"
+    "<b>2.</b> <b>Deposit</b> in crypto: choose USDT → network (e.g. BEP20 or TRX) → send to the wallet address. "
+    "Put in at least <b>20 USDT</b> and the <b>100% bonus + 80 free spins</b> kick in.\n\n"
+    "<b>3.</b> Open <b>Sports → Football World Cup 2026</b> and find your match.\n\n"
+    "<b>4.</b> Tap your side (<b>{market}</b>), type your stake, hit <b>Place a bet</b>.\n\n"
+    "Withdrawals in crypto, in minutes. 🟢"
+)

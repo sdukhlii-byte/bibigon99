@@ -59,6 +59,10 @@ LIVE_POLL_SEC = int(os.getenv("LIVE_POLL_SEC", 20))            # cadence while a
 # to clear the is_live flag and to gate the hub's "live" status so a finished
 # game can never linger as LIVE.
 LIVE_MAX_AGE = int(os.getenv("LIVE_MAX_AGE_MIN", 150)) * 60    # 2h30m
+# Odds enrichment (pickcenter) is throttled so the 20s live loop doesn't hammer
+# the summary endpoint for fixtures that may simply never get a posted 3-way.
+ODDS_ENRICH_EVERY = int(os.getenv("ODDS_ENRICH_EVERY_SEC", 600))   # 10 min
+_last_odds_enrich = 0.0
 VIP_PRICE_STARS = int(os.getenv("VIP_PRICE_STARS", 250))       # Telegram Stars / month
 VIP_CHANNEL_INVITE = os.getenv("VIP_CHANNEL_INVITE", "")       # private VIP channel invite link
 WC_END = os.getenv("WC_END", "2026-07-19")                     # real deadline = honest FOMO
@@ -134,6 +138,33 @@ def kb_webapp(label: str | None = None) -> InlineKeyboardMarkup:
     ]])
 
 
+# Coinplay betting-guide screenshots, in order (step 1..4). Drop the real files
+# into MEDIA_DIR; missing files -> the guide degrades to text-only.
+GUIDE_IMAGES = [
+    os.getenv("GUIDE_IMG_1", "guide_register.png"),
+    os.getenv("GUIDE_IMG_2", "guide_deposit.png"),
+    os.getenv("GUIDE_IMG_3", "guide_match.png"),
+    os.getenv("GUIDE_IMG_4", "guide_betslip.png"),
+]
+
+# our pick side -> Coinplay's market label (W1/X/W2), confirmed from the site
+_COIN_MARKET = {"1": "1X2 - W1", "X": "1X2 - X", "2": "1X2 - W2"}
+
+
+def kb_play(uid: int) -> InlineKeyboardMarkup:
+    """Hot-iron keyboard: the cash CTA (tracker, attribution intact) plus a
+    'how to bet' guide button so a hesitant user can see exactly what to do."""
+    base = TRACKER_URL or PRELANDING_URL
+    sep = "&" if "?" in base else "?"
+    param = "sub_id_2" if TRACKER_URL else "uid"
+    tag = "&sub_id_3=bot" if TRACKER_URL else ""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=T.BTN_CASH_READ,
+                              url=f"{base}{sep}{param}={uid}{tag}")],
+        [InlineKeyboardButton(text=T.BTN_HOWTO, callback_data="guide:bet")],
+    ])
+
+
 async def safe_send(uid: int, text: str, **kw):
     try:
         await bot.send_message(uid, text, **kw)
@@ -148,7 +179,7 @@ async def safe_send(uid: int, text: str, **kw):
 # ----------------------------------------------------------------------
 # MEDIA — funnel-stage creatives (media/*.png). Missing file -> text only.
 # ----------------------------------------------------------------------
-from aiogram.types import FSInputFile
+from aiogram.types import FSInputFile, InputMediaPhoto
 
 MEDIA_DIR = os.getenv("MEDIA_DIR", "media")
 
@@ -410,6 +441,42 @@ def _ml_prob(ml: int) -> float:
     return abs(ml) / (abs(ml) + 100) if ml < 0 else 100 / (ml + 100)
 
 
+def _ml_value(side) -> int | None:
+    """Pull an American moneyline int from an ESPN odds-side object. ESPN is
+    inconsistent: the value can be a flat `moneyLine`, or nested under
+    `current`/`close`/`open` -> `moneyLine` as an int or an {'american': '+120'}
+    object, or a string like '+120'. 0 / missing / non-numeric -> None."""
+    if not isinstance(side, dict):
+        return None
+    cand = side.get("moneyLine")
+    if cand is None:
+        nest = side.get("current") or side.get("close") or side.get("open") or {}
+        ml = nest.get("moneyLine") if isinstance(nest, dict) else None
+        cand = (ml.get("american") or ml.get("value")) if isinstance(ml, dict) else ml
+    if isinstance(cand, bool):           # bool is a subclass of int — reject
+        return None
+    if isinstance(cand, str):
+        mt = re.search(r"[+-]?\d+", cand)
+        cand = int(mt.group()) if mt else None
+    if isinstance(cand, (int, float)) and int(cand) != 0:
+        return int(cand)
+    return None
+
+
+def _extract_3way(odds_obj) -> dict | None:
+    """{'h','d','a'} American moneylines from an ESPN scoreboard `odds` entry
+    or a summary `pickcenter` entry (same shape). None unless all three are
+    present — a partial line is useless for a 1X2 payout."""
+    if not isinstance(odds_obj, dict):
+        return None
+    h = _ml_value(odds_obj.get("homeTeamOdds"))
+    a = _ml_value(odds_obj.get("awayTeamOdds"))
+    d = _ml_value(odds_obj.get("drawOdds"))
+    if h is not None and a is not None and d is not None:
+        return {"h": h, "a": a, "d": d}
+    return None
+
+
 def implied_probs(odds_full: str | None):
     """{'1': 54, 'X': 24, '2': 22} normalized de-vigged percentages,
     or None. The market's opinion, not ours."""
@@ -484,7 +551,7 @@ async def do_settle(mid: int, result: str, score: str) -> int:
     for uid, ok, exact in rows:
         u = await db.get_user(uid)
         if ok:
-            kb = kb_bridge(uid, T.BTN_CASH_READ) if not u["registered"] else None
+            kb = kb_play(uid) if not u["registered"] else None
             text = (T.RESULT_EXACT.format(t1=m["t1"], t2=m["t2"], score=score,
                                           streak=u["streak"])
                     if exact else
@@ -583,6 +650,109 @@ async def void_cmd(msg: Message):
                          f"scored, removed from live.")
     except Exception as e:
         await msg.answer(f"Format: /void <match_id>\n({e})")
+
+
+@r.message(Command("link"))
+async def link_cmd(msg: Message):
+    """/link <match_id> <coinplay_url> — attach the Coinplay deep link for a
+    fixture so the Play CTA opens that exact match. /link <match_id> clear to
+    remove. Get ids from /schedule or /unsettled."""
+    if not admin(msg):
+        return
+    try:
+        parts = msg.text.split(maxsplit=2)
+        mid = int(parts[1])
+        m = await db.get_match(mid)
+        if not m:
+            await msg.answer(f"No match #{mid}.")
+            return
+        if len(parts) < 3 or parts[2].strip().lower() == "clear":
+            await db.set_match_link(mid, None)
+            await msg.answer(f"Cleared link for #{mid} ({m['t1']} vs {m['t2']}).")
+            return
+        url = parts[2].strip()
+        if not url.startswith("https://"):
+            await msg.answer("Link must start with https://")
+            return
+        await db.set_match_link(mid, url)
+        await msg.answer(f"🔗 #{mid} {m['t1']} vs {m['t2']} →\n{url}")
+    except Exception as e:
+        await msg.answer(
+            "Format: /link <match_id> <https://coinplay.com/...>\n"
+            f"or /link <match_id> clear\n({e})")
+
+
+@r.message(Command("links"))
+async def links_cmd(msg: Message):
+    """Admin: upcoming matches and whether each has a Coinplay deep link —
+    so you can see what still needs a link wired."""
+    if not admin(msg):
+        return
+    rows = await db.matches_where(
+        "result IS NULL AND kickoff > ? ORDER BY kickoff LIMIT 30",
+        (int(time.time()),))
+    if not rows:
+        await msg.answer("No upcoming matches.")
+        return
+    lines = ["🔗 <b>Upcoming match links:</b>"]
+    for m in rows:
+        mark = "✅" if ("coinplay_url" in m.keys() and m["coinplay_url"]) else "❌"
+        lines.append(f"{mark} #{m['id']} {m['t1']} vs {m['t2']}")
+    miss = sum(1 for m in rows
+               if not ("coinplay_url" in m.keys() and m["coinplay_url"]))
+    lines.append(f"\n{miss} still without a link.")
+    await msg.answer("\n".join(lines))
+
+
+async def send_betting_guide(uid: int):
+    """Step-by-step 'how to place the bet on Coinplay' — screenshots album +
+    personalized text (maps the user's nearest pending pick to Coinplay's
+    W1/X/W2 market) + the cash CTA. Degrades to text-only if screenshots aren't
+    installed in MEDIA_DIR."""
+    side = t1 = t2 = None
+    try:
+        details = await db.user_pick_details(uid)        # {mid: (pick, score)}
+        if details:
+            now = int(time.time())
+            for m in await db.matches_where(
+                    "result IS NULL AND kickoff > ? ORDER BY kickoff", (now,)):
+                if m["id"] in details:
+                    side = details[m["id"]][0]
+                    t1, t2 = m["t1"], m["t2"]
+                    break
+    except Exception:
+        log.exception("guide personalization failed for %s", uid)
+
+    market = _COIN_MARKET.get(side, "W1 / X / W2")
+    if side and t1:
+        coin_side = t1 if side == "1" else (t2 if side == "2" else "Draw")
+        header = T.GUIDE_HEADER_PICK.format(
+            t1=t1, t2=t2, coin_side=coin_side, market=market)
+    else:
+        header = T.GUIDE_HEADER_GENERIC
+    body = header + T.GUIDE_STEPS.format(market=market)
+
+    # visual: screenshots album first (if installed), then steps + CTA button
+    photos = [p for p in (media(n) for n in GUIDE_IMAGES) if p]
+    if photos:
+        try:
+            await bot.send_media_group(
+                uid, [InputMediaPhoto(media=FSInputFile(p)) for p in photos])
+        except Exception as e:
+            log.warning("guide album to %s failed: %s", uid, e)
+    await safe_send(uid, body, reply_markup=kb_play(uid))
+
+
+@r.message(Command("howto"))
+async def howto_cmd(msg: Message):
+    """Public: show the Coinplay how-to-bet walkthrough."""
+    await send_betting_guide(msg.from_user.id)
+
+
+@r.callback_query(F.data == "guide:bet")
+async def cb_guide(cb: CallbackQuery):
+    await send_betting_guide(cb.from_user.id)
+    await cb.answer()
 
 
 @r.message(Command("stats"))
@@ -828,16 +998,9 @@ async def _sync_fixtures_inner() -> dict:
             odds = odds_obj.get("details")
             if odds:                                # real ESPN line, when given
                 await db.set_match_odds(mid, str(odds)[:32])
-            try:
-                full = {
-                    "h": (odds_obj.get("homeTeamOdds") or {}).get("moneyLine"),
-                    "a": (odds_obj.get("awayTeamOdds") or {}).get("moneyLine"),
-                    "d": (odds_obj.get("drawOdds") or {}).get("moneyLine"),
-                }
-                if all(isinstance(v, int) for v in full.values()):
-                    await db.set_match_odds_full(mid, json.dumps(full))
-            except Exception:
-                pass
+            full = _extract_3way(odds_obj)          # robust across ESPN shapes
+            if full:
+                await db.set_match_odds_full(mid, json.dumps(full))
             state = ev.get("status", {}).get("type", {}).get("state", "pre")
             tname = ev.get("status", {}).get("type", {}).get("name", "")
             completed = bool(ev.get("status", {}).get("type", {})
@@ -967,8 +1130,59 @@ async def _sync_fixtures_inner() -> dict:
     for m in overdue[:10]:                     # cap per sync run
         if await recover_match_result(m):
             recovered += 1
+
+    # odds enrichment: the scoreboard feed frequently ships only a single
+    # `details` line (no 3-way moneyline), which leaves the Play calculator
+    # without a draw / underdog price. Pull the richer `pickcenter` from the
+    # per-event summary for upcoming matches still missing odds_full. Throttled
+    # (the live loop calls this every ~20s) and capped; once stored we don't
+    # refetch a match.
+    global _last_odds_enrich
+    enriched = 0
+    nowt = time.time()
+    if nowt - _last_odds_enrich > ODDS_ENRICH_EVERY:
+        _last_odds_enrich = nowt
+        need_odds = await db.matches_where(
+            "odds_full IS NULL AND result IS NULL AND ext_id IS NOT NULL "
+            "AND kickoff > ? AND kickoff < ?",
+            (int(nowt), int(nowt) + 4 * DAY))
+        for m in need_odds[:8]:                # cap HTTP per run
+            if await enrich_match_odds(m):
+                enriched += 1
+
     return {"fixtures": upserted, "settled": settled,
-            "stale_cleared": len(stale), "recovered": recovered}
+            "stale_cleared": len(stale), "recovered": recovered,
+            "enriched": enriched}
+
+
+async def enrich_match_odds(m) -> bool:
+    """Fetch the per-event summary and store the 3-way moneyline from the
+    highest-priority bookmaker in `pickcenter`. Returns True if odds_full was
+    written."""
+    url = (f"https://site.api.espn.com/apis/site/v2/sports/soccer/"
+           f"{ESPN_LEAGUE}/summary")
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, params={"event": m["ext_id"]},
+                             timeout=15) as resp:
+                if resp.status != 200:
+                    return False
+                data = await resp.json()
+    except Exception as e:
+        log.warning("odds summary fetch failed for %s: %s", m["ext_id"], e)
+        return False
+    pc = data.get("pickcenter") or []
+    pc = sorted(pc, key=lambda x: (x.get("provider") or {}).get("priority", 99))
+    for entry in pc:
+        full = _extract_3way(entry)
+        if full:
+            await db.set_match_odds_full(m["id"], json.dumps(full))
+            if not m["odds"] and entry.get("details"):
+                await db.set_match_odds(m["id"], str(entry["details"])[:32])
+            log.info("enriched odds for match %s (%s vs %s): %s",
+                     m["id"], m["t1"], m["t2"], full)
+            return True
+    return False
 
 
 async def recover_match_result(m) -> bool:
@@ -1037,13 +1251,16 @@ async def sync_cmd(msg: Message):
     """Admin: force a fixtures sync and see what the API answered."""
     if not admin(msg):
         return
+    global _last_odds_enrich
+    _last_odds_enrich = 0.0          # manual sync always runs odds enrichment
     res = await sync_fixtures()
     await db.meta_set("last_sync", str(int(time.time())))
     if "error" in res:
         await msg.answer(f"⚠️ Sync error: {res['error']}")
     else:
         await msg.answer(f"✅ Synced {res['fixtures']} fixtures, "
-                         f"auto-settled {res['settled']}.")
+                         f"auto-settled {res['settled']}, "
+                         f"odds enriched {res.get('enriched', 0)}.")
 
 
 # ----------------------------------------------------------------------
@@ -1471,6 +1688,8 @@ async def api_matches(request):
         "split": dist.get(m["id"], {"1": 0, "X": 0, "2": 0}),
         "intel": implied_probs(m["odds_full"] if "odds_full" in m.keys() else None),
         "book": _book(m),
+        "coinplay_url": (m["coinplay_url"]
+                         if "coinplay_url" in m.keys() else None),
         "form": {"t1": form.get(m["t1"], ""), "t2": form.get(m["t2"], "")},
     } for m in rows])
 

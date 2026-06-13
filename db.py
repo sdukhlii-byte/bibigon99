@@ -142,6 +142,11 @@ async def init():
                 "ALTER TABLE matches ADD COLUMN ft_pushed INTEGER DEFAULT 0")
         except Exception:
             pass
+        try:
+            await db.execute(
+                "ALTER TABLE matches ADD COLUMN coinplay_url TEXT")
+        except Exception:
+            pass
         await db.commit()
 
 
@@ -301,6 +306,16 @@ async def set_match_odds_full(mid: int, odds_json: str):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("UPDATE matches SET odds_full=? WHERE id=?",
                          (odds_json, mid))
+        await db.commit()
+
+
+async def set_match_link(mid: int, url: str | None):
+    """Store (or clear) the per-match Coinplay deep link — the betting page
+    for that exact fixture, so the Play CTA can drop the user straight onto it
+    instead of the generic sportsbook."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE matches SET coinplay_url=? WHERE id=?",
+                         (url, mid))
         await db.commit()
 
 
